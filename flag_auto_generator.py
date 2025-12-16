@@ -417,8 +417,30 @@ class ConfigEditor(tb.Window):
         preview_container = ttk.Frame(source_frame)
         preview_container.pack(fill="both", expand=True)
         self.preview_columns = ("A", "B", "G", "K")
+
+        style = ttk.Style(self)
+        style.configure(
+            "Preview.Treeview",
+            rowheight=22,
+            borderwidth=1,
+            relief="solid",
+            bordercolor="#ffffff",
+            lightcolor="#ffffff",
+            darkcolor="#ffffff",
+        )
+        style.configure(
+            "Preview.Treeview.Heading",
+            borderwidth=1,
+            relief="solid",
+            anchor="center",
+        )
+
         self.preview_tree = ttk.Treeview(
-            preview_container, columns=self.preview_columns, show="headings", height=8
+            preview_container,
+            columns=self.preview_columns,
+            show="headings",
+            height=8,
+            style="Preview.Treeview",
         )
         vsb = ttk.Scrollbar(preview_container, orient="vertical", command=self.preview_tree.yview)
         self.preview_tree.configure(yscrollcommand=vsb.set)
@@ -524,16 +546,43 @@ class ConfigEditor(tb.Window):
             messagebox.showinfo("シートが空です", "表示できるデータがありません。", parent=self)
             return
 
+        col_widths = {"A": 80, "B": 120, "G": 140, "K": 140}
         self.preview_tree.configure(columns=self.preview_columns)
         for col in self.preview_columns:
-            self.preview_tree.heading(col, text=col)
-            self.preview_tree.column(col, width=120, anchor="w")
+            self.preview_tree.heading(col, text=col, anchor="center")
+            self.preview_tree.column(
+                col,
+                width=col_widths.get(col, 120),
+                minwidth=60,
+                anchor="center",
+                stretch=False,
+            )
 
         for item in self.preview_tree.get_children():
             self.preview_tree.delete(item)
 
+        header_row = 10
+        group_size = 3  # 11-13,14-16... の先頭行のみ表示
+        max_row_value = ws.max_row or 0
+
+        if max_row_value < header_row:
+            messagebox.showinfo(
+                "データなし",
+                f"{header_row}行目以降に表示できるデータがありません。",
+                parent=self,
+            )
+            return
+
+        # ヘッダー行(10行目)を挿入
+        header_vals = []
+        for c in preview_col_indices:
+            v = ws.cell(header_row, c).value
+            header_vals.append("" if v is None else str(v))
+        self.preview_tree.insert("", "end", values=header_vals)
+
+        data_start_row = header_row + 1  # 11行目
         row_count = 0
-        for r in range(1, (ws.max_row or 0) + 1):
+        for r in range(data_start_row, max_row_value + 1, group_size):
             a_val = ws.cell(r, preview_col_indices[0]).value
             if a_val is None or (isinstance(a_val, str) and not a_val.strip()):
                 break
@@ -547,14 +596,18 @@ class ConfigEditor(tb.Window):
             row_count += 1
 
         if row_count == 0:
+            for item in self.preview_tree.get_children():
+                self.preview_tree.delete(item)
             messagebox.showinfo(
                 "データなし",
-                "A列が空のため表示できる行がありません。",
+                "11行目以降の先頭行(A列)が空のため表示できるデータがありません。",
                 parent=self,
             )
             return
 
-        self.preview_title.set(f"{sheet_name} プレビュー（{row_count}行: A列が空になるまで）")
+        self.preview_title.set(
+            f"{sheet_name} プレビュー（{row_count}行: 10行目ヘッダー＋11行目以降3行刻み先頭行）"
+        )
 
     def _insert_tool(self, tool_name: str, nos_text: str):
         self.tools_tree.insert("", "end", values=(tool_name, nos_text))
