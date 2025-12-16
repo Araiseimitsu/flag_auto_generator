@@ -6,6 +6,7 @@ import threading
 
 import ttkbootstrap as tb
 from ttkbootstrap import ttk
+from ttkbootstrap.scrolled import ScrolledFrame
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
 
@@ -129,6 +130,21 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     tools = cfg["tools"]
     tool_to_measure_nos = cfg["tool_to_measure_nos"]
 
+    def _detect_sep(ws):
+        sep_counts = {",": 0, ";": 0}
+        # 既存の数式から区切り文字を推定（最初に見つかったものを優先）
+        for row in ws.iter_rows(min_row=1, max_row=min(200, ws.max_row or 200)):
+            for cell in row:
+                v = cell.value
+                if isinstance(v, str) and v.startswith("="):
+                    sep_counts[","] += v.count(",")
+                    sep_counts[";"] += v.count(";")
+            if sep_counts[","] or sep_counts[";"]:
+                break
+        if sep_counts[","] == 0 and sep_counts[";"] == 0:
+            return None
+        return "," if sep_counts[","] >= sep_counts[";"] else ";"
+
     # SEQUENCE関数の第1引数として使用する値を計算（工具開始行-4）
     sequence_count = tool_start_row - 4
 
@@ -141,6 +157,9 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
     ws = wb[sheet_name]
     ws_values = wb_values[sheet_name]
+    auto_sep = _detect_sep(ws)
+    if auto_sep:
+        formula_arg_sep = auto_sep
 
     # 1) 測定No(A列の整数) → 行番号
     no_col = column_index_from_string(measure_no_col)
@@ -187,43 +206,25 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     written = 0
     for col_idx in range(flag_col_start, flag_col_end + 1):
         col_letter = get_column_letter(col_idx)
-        
-        # 1行目: SEQUENCE(sequence_count,1,11,3) - measure_row_minから開始
-        formula_row1 = (
-            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
-            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
-        )
-        ws.cell(1, col_idx).value = formula_row1
+        # FILTER/SEQUENCE 非対応環境でも壊れないよう従来関数のみでカウント
+        def _count_formula(start_row: int) -> str:
+            rng = f"{col_letter}{start_row}:{col_letter}{measure_row_max}"
+            # =SUMPRODUCT(--(L11:L196<>""),--(MOD(ROW(L11:L196)-11,3)=0))
+            return (
+                f"=SUMPRODUCT(--({rng}<>\"\" ){formula_arg_sep}"
+                f"--(MOD(ROW({rng})-{start_row}{formula_arg_sep}{measure_row_step})=0))"
+            )
 
-        # 2行目: SEQUENCE(sequence_count,1,12,3) - measure_row_min+1から開始
-        formula_row2 = (
-            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 1}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
-            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 1}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
-        )
-        ws.cell(2, col_idx).value = formula_row2
-
-        # 3行目: SEQUENCE(sequence_count,1,13,3) - measure_row_min+2から開始
-        formula_row3 = (
-            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 2}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
-            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 2}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
-        )
-        ws.cell(3, col_idx).value = formula_row3
-
-        # デバッグ用ログ出力
-        print(f"列 {col_letter} 1行目: {formula_row1}")
-        print(f"列 {col_letter} 2行目: {formula_row2}")
-        print(f"列 {col_letter} 3行目: {formula_row3}")
+        ws.cell(1, col_idx).value = _count_formula(measure_row_min)
+        ws.cell(2, col_idx).value = _count_formula(measure_row_min + 1)
+        ws.cell(3, col_idx).value = _count_formula(measure_row_min + 2)
 
         # 測定行に依頼セルを設定
         for mr, tool_rows in measure_row_to_tool_rows.items():
-            conds = ",".join([f'{col_letter}${tr}<>""' for tr in tool_rows])
-            ws.cell(mr, col_idx).value = f'=IF(OR({conds}),"依頼","")'
+            conds = f"{formula_arg_sep}".join([f'{col_letter}${tr}<>""' for tr in tool_rows])
+            ws.cell(mr, col_idx).value = (
+                f'=IF(OR({conds}){formula_arg_sep}"依頼"{formula_arg_sep}""")'
+            )
             written += 1
 
     if written == 0:
@@ -480,7 +481,10 @@ class ConfigEditor(tb.Window):
         header_frame.pack(fill="x", padx=10, pady=(10, 0))
         ttk.Button(header_frame, text="ヘルプ", command=self._show_help).pack(side="right")
 
-        main = ttk.Frame(self, padding=10)
+        # スクロール可能コンテナ（ttkbootstrap組み込み）で小さい画面でも末尾ボタンまで操作可能にする
+        scroll = ScrolledFrame(self, autohide=True)
+        scroll.pack(fill="both", expand=True)
+        main = ttk.Frame(scroll, padding=10)
         main.pack(fill="both", expand=True)
 
         # 元Excel読み込み＆プレビュー
