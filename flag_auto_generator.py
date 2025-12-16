@@ -12,9 +12,6 @@ from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 # Excel COM オートメーション（Windows環境でファイル破損を防ぐため）
-# openpyxlで保存すると元の数式が配列数式になる問題があるため、
-# Excel COMでの処理をデフォルトで有効にする
-USE_EXCEL_COM_FOR_SAVE = True
 try:
     import win32com.client
     HAS_WIN32COM = True
@@ -51,113 +48,6 @@ def pick_save_path(title: str, defaultextension: str, filetypes, parent=None):
     )
 
 
-def _save_workbook_atomic(wb, out_path: str, parent=None) -> str:
-    out_path = os.path.abspath(out_path)
-    out_dir = os.path.dirname(out_path)
-    if out_dir and not os.path.isdir(out_dir):
-        os.makedirs(out_dir, exist_ok=True)
-
-    base, ext = os.path.splitext(out_path)
-    ext = ext or ".xlsx"
-    tmp_path = f"{base}.tmp{ext}"
-
-    while True:
-        try:
-            wb.save(tmp_path)
-            os.replace(tmp_path, out_path)
-            return out_path
-        except PermissionError as e:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-            if parent is None:
-                raise
-            retry = messagebox.askretrycancel(
-                "保存に失敗",
-                "出力先ファイルに書き込めません。\n"
-                "Excelで出力先ファイルを開いている場合は閉じてから「再試行」を押してください。\n\n"
-                f"出力先:\n{out_path}\n\n"
-                f"詳細:\n{e}",
-                parent=parent,
-            )
-            if not retry:
-                raise
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-
-
-def _recalculate_with_excel_com(xlsx_path: str, sheet_name: str = None, fix_range: str = None, parent=None) -> bool:
-    """
-    Excel COMでファイルを開いて数式を再計算し、キャッシュ値を保存する
-    配列数式の問題も解決する（数式を再入力して{}を外す）
-    
-    Args:
-        xlsx_path: Excelファイルパス
-        sheet_name: 対象シート名（指定時のみ処理）
-        fix_range: 配列数式を修正する範囲（例: "A11:K196"）
-        parent: 親ウィンドウ
-    
-    Returns:
-        成功した場合True
-    """
-    if not HAS_WIN32COM:
-        return False
-    
-    xlsx_path = os.path.abspath(xlsx_path)
-    excel = None
-    wb = None
-    try:
-        excel = win32com.client.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        
-        wb = excel.Workbooks.Open(xlsx_path)
-        
-        # 指定されたシートの配列数式を修正
-        if sheet_name and fix_range:
-            try:
-                ws = wb.Sheets(sheet_name)
-                rng = ws.Range(fix_range)
-                
-                # 各セルの数式を再入力して配列数式フラグを外す
-                for cell in rng:
-                    try:
-                        formula = cell.Formula
-                        # 数式がある場合のみ再設定
-                        if formula and isinstance(formula, str) and formula.startswith('='):
-                            # 数式を一度クリアして再設定（配列数式を解除）
-                            cell.Formula = formula
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        
-        # 全ブックの数式を完全に再構築
-        excel.CalculateFullRebuild()
-        
-        wb.Save()
-        return True
-    except Exception:
-        return False
-    finally:
-        if wb:
-            try:
-                wb.Close(False)
-            except Exception:
-                pass
-        if excel:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
-
-
 def _save_with_excel_com(xlsx_path: str, out_path: str, cell_changes: list, sheet_name: str, parent=None) -> str:
     """
     Excel COMオートメーションでセルに値を書き込む（高速版）
@@ -173,30 +63,23 @@ def _save_with_excel_com(xlsx_path: str, out_path: str, cell_changes: list, shee
     Returns:
         保存されたファイルのパス
     """
-    print(f"[DEBUG] Excel COM保存開始: {len(cell_changes)}件のセル変更")
-    
     xlsx_path = os.path.abspath(xlsx_path)
     out_path = os.path.abspath(out_path)
     
     # 元ファイルと出力先が異なる場合はコピー
     if xlsx_path != out_path:
-        print(f"[DEBUG] ファイルコピー: {xlsx_path} → {out_path}")
         shutil.copy2(xlsx_path, out_path)
     
     excel = None
     wb = None
     try:
-        print("[DEBUG] Excel起動中...")
         excel = win32com.client.Dispatch("Excel.Application")
         excel.Visible = False
         excel.DisplayAlerts = False
-        excel.ScreenUpdating = False  # 画面更新を無効化（高速化）
+        excel.ScreenUpdating = False
         
-        print(f"[DEBUG] ワークブックを開く: {out_path}")
         wb = excel.Workbooks.Open(out_path)
         ws = wb.Sheets(sheet_name)
-        
-        print(f"[DEBUG] セル書き込み開始（Range一括書き込みで高速化）...")
         # 列ごとにグループ化
         col_changes = {}
         for row, col, value in cell_changes:
@@ -204,19 +87,12 @@ def _save_with_excel_com(xlsx_path: str, out_path: str, cell_changes: list, shee
                 col_changes[col] = {}
             col_changes[col][row] = value
         
-        print(f"[DEBUG] {len(col_changes)}列に対して書き込みを実行")
-        
-        # 列ごとにRange一括書き込み（超高速）
-        col_count = 0
+        # 列ごとにRange一括書き込み
         for col, row_values in col_changes.items():
-            col_count += 1
             col_letter = get_column_letter(col)
             rows = sorted(row_values.keys())
             if not rows:
                 continue
-            
-            if col_count % 10 == 0:
-                print(f"[DEBUG] {col_count}/{len(col_changes)}列目 ({col_letter}列) 処理中...")
             
             min_row = rows[0]
             max_row = rows[-1]
@@ -228,8 +104,8 @@ def _save_with_excel_com(xlsx_path: str, out_path: str, cell_changes: list, shee
                     rng = ws.Range(ws.Cells(min_row, col), ws.Cells(max_row, col))
                     values = [[row_values[r]] for r in rows]
                     rng.Value = values
-                except Exception as e:
-                    print(f"[WARN] {col_letter}列の一括書き込み失敗、個別書き込みに切替: {e}")
+                except Exception:
+                    # 一括書き込み失敗時は個別に書き込み
                     for row in rows:
                         ws.Cells(row, col).Value = row_values[row]
             else:
@@ -237,15 +113,10 @@ def _save_with_excel_com(xlsx_path: str, out_path: str, cell_changes: list, shee
                 for row in rows:
                     ws.Cells(row, col).Value = row_values[row]
         
-        print(f"[DEBUG] 全{len(col_changes)}列の書き込み完了")
-        
-        print(f"[DEBUG] 保存中...")
         excel.ScreenUpdating = True
         wb.Save()
-        print(f"[DEBUG] Excel COM保存完了")
         return out_path
     except Exception as e:
-        print(f"[ERROR] Excel COM保存失敗: {e}")
         if parent:
             messagebox.showerror(
                 "Excel COM エラー",
@@ -509,26 +380,17 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     wb.close()
     wb_values.close()
 
-    # Excel COMで保存（元の数式を壊さない）
-    if HAS_WIN32COM and USE_EXCEL_COM_FOR_SAVE:
-        saved = _save_with_excel_com(xlsx_path, out_path, cell_changes, sheet_name, parent=parent)
-        return saved, measure_no_to_row
+    # Excel COMで保存（元の数式を保護）
+    if not HAS_WIN32COM:
+        if parent:
+            messagebox.showerror(
+                "エラー",
+                "pywin32がインストールされていません。\n\npip install pywin32",
+                parent=parent
+            )
+        raise ImportError("pywin32が必要です")
     
-    # フォールバック: openpyxlで書き込み（元の数式が配列数式になる可能性あり）
-    wb = load_workbook(xlsx_path, rich_text=True)
-    ws = wb[sheet_name]
-    for row, col, value in cell_changes:
-        ws.cell(row, col).value = value
-
-    try:
-        wb.calculation.calcMode = "auto"
-        wb.calculation.fullCalcOnLoad = True
-        wb.calculation.calcOnSave = True
-        wb.calculation.forceFullCalc = True
-    except Exception:
-        pass
-
-    saved = _save_workbook_atomic(wb, out_path, parent=parent)
+    saved = _save_with_excel_com(xlsx_path, out_path, cell_changes, sheet_name, parent=parent)
     return saved, measure_no_to_row
 
 
@@ -661,18 +523,17 @@ def write_measurement_not_required(
     # openpyxlのワークブックを閉じる
     wb.close()
 
-    # Excel COMで保存（元の数式を壊さない）
-    if HAS_WIN32COM and USE_EXCEL_COM_FOR_SAVE:
-        saved = _save_with_excel_com(xlsx_path, out_path, cell_changes, sheet_name, parent=parent)
-        return saved
+    # Excel COMで保存（元の数式を保護）
+    if not HAS_WIN32COM:
+        if parent:
+            messagebox.showerror(
+                "エラー",
+                "pywin32がインストールされていません。\n\npip install pywin32",
+                parent=parent
+            )
+        raise ImportError("pywin32が必要です")
     
-    # フォールバック: openpyxlで書き込み
-    wb = load_workbook(xlsx_path, rich_text=True)
-    ws = wb[sheet_name]
-    for row, col, value in cell_changes:
-        ws.cell(row, col).value = value
-
-    saved = _save_workbook_atomic(wb, out_path, parent=parent)
+    saved = _save_with_excel_com(xlsx_path, out_path, cell_changes, sheet_name, parent=parent)
     return saved
 
 
@@ -834,37 +695,19 @@ class ConfigEditor(tb.Window):
         basic_right = ttk.LabelFrame(basic_inner, text="測定不要書き込み設定", padding=10)
         basic_right.grid(row=0, column=1, sticky="nsew")
 
-        def add_field(row, col, label, key, width=12):
-            col_offset = col * 2
-            ttk.Label(basic_left, text=label).grid(row=row, column=col_offset, sticky="w", padx=(0, 8), pady=3)
-            ttk.Entry(basic_left, textvariable=self.vars[key], width=width).grid(row=row, column=col_offset + 1, sticky="w", padx=(0, 20), pady=3)
+        # ユーザーが操作する項目のみを表示（工具開始行）
+        ttk.Label(basic_left, text="工具開始行").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(basic_left, textvariable=self.vars["tool_start_row"], width=12).grid(row=0, column=1, sticky="w", padx=(0, 20), pady=3)
+        
+        ttk.Label(basic_left, text="シート名").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(basic_left, textvariable=self.vars["sheet_name"], width=25).grid(row=1, column=1, sticky="w", padx=(0, 20), pady=3)
 
-        add_field(0, 0, "シート名", "sheet_name", width=25)
-        add_field(1, 0, "測定No列", "measure_no_col")
-        add_field(2, 0, "測定行(min)", "measure_row_min")
-        add_field(3, 0, "測定行(max)", "measure_row_max")
-        add_field(4, 0, "測定行ステップ", "measure_row_step")
-        add_field(5, 0, "集計行(min)", "summary_row_min")
-        add_field(6, 0, "集計行(max)", "summary_row_max")
-        add_field(7, 0, "集計行ステップ", "summary_row_step")
-        add_field(0, 1, "数式区切り(, / ;)", "formula_arg_sep")
-        add_field(1, 1, "工具開始行", "tool_start_row")
-        add_field(2, 1, "工具名列", "tool_name_col")
-        add_field(3, 1, "工具行ステップ", "tool_row_step")
-
-        ttk.Label(basic, text="出力列: L～SR（固定）").pack(anchor="w", pady=3)
-        ttk.Label(basic_right, text="E列 (工具開始行-3) の行番号:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
-        ttk.Entry(
-            basic_right,
-            textvariable=self.vars["not_required_row"],
-            width=15,
-            state="readonly",
-        ).grid(row=0, column=1, sticky="w", padx=(0, 30), pady=5)
+        ttk.Label(basic, text="出力列: L（固定）").pack(anchor="w", pady=3)
         ttk.Label(
             basic_right,
-            text="L～SR列に'-'を入れるNo.(カンマ区切り):",
-        ).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
-        ttk.Entry(basic_right, textvariable=self.vars["not_required_nos"], width=40).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=5)
+            text="L列に'-'を入れるNo.(カンマ区切り):",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(basic_right, textvariable=self.vars["not_required_nos"], width=40).grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=5)
         basic_right.columnconfigure(1, weight=1)
 
         tools_frame = ttk.LabelFrame(main, text="工具と測定No対応", padding=10)
@@ -1292,7 +1135,11 @@ class ConfigEditor(tb.Window):
                             parent=self,
                         )
                     else:
-                        messagebox.showinfo("完了", f"生成しました:\n{result['saved_path']}", parent=self)
+                        messagebox.showinfo(
+                            "完了",
+                            f"生成しました:\n{result['saved_path']}\n\n※L列をSR列までコピーしてください",
+                            parent=self
+                        )
                 else:
                     messagebox.showerror("失敗", result["error"], parent=self)
         
