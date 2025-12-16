@@ -1,7 +1,8 @@
-import os
+﻿import os
 import re
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import threading
 
 import ttkbootstrap as tb
 from ttkbootstrap import ttk
@@ -111,22 +112,25 @@ def _try_extract_int(value):
 def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=None):
     sheet_name = cfg["sheet_name"]
     measure_no_col = cfg.get("measure_no_col", "A")
-    measure_row_min = int(cfg.get("measure_row_min", 9))
-    measure_row_max = int(cfg.get("measure_row_max", 74))
-    measure_row_step = int(cfg.get("measure_row_step", 2))
-    summary_row_min = int(cfg.get("summary_row_min", 9))
-    summary_row_max = int(cfg.get("summary_row_max", 159))
-    summary_row_step = int(cfg.get("summary_row_step", 2))
+    measure_row_min = int(cfg.get("measure_row_min", 11))
+    measure_row_step = int(cfg.get("measure_row_step", 3))
+    tool_start_row = int(cfg.get("tool_start_row", 200))
+    measure_row_max = int(cfg.get("measure_row_max", tool_start_row - 4))
+    summary_row_min = int(cfg.get("summary_row_min", measure_row_min))
+    summary_row_max = int(cfg.get("summary_row_max", measure_row_max))
+    summary_row_step = int(cfg.get("summary_row_step", measure_row_step))
     formula_arg_sep = str(cfg.get("formula_arg_sep", ",")).strip() or ","
-    flag_col_start = column_index_from_string("I")
-    flag_col_end = column_index_from_string("SN")
+    flag_col_start = column_index_from_string("L")
+    flag_col_end = column_index_from_string("SR")
 
-    tool_start_row = int(cfg.get("tool_start_row", 75))
-    tool_name_col = cfg.get("tool_name_col", "B")
-    tool_row_step = int(cfg.get("tool_row_step", 2))
+    tool_name_col = cfg.get("tool_name_col", "E")
+    tool_row_step = int(cfg.get("tool_row_step", measure_row_step))
 
     tools = cfg["tools"]
     tool_to_measure_nos = cfg["tool_to_measure_nos"]
+
+    # SEQUENCE関数の第1引数として使用する値を計算（工具開始行-4）
+    sequence_count = tool_start_row - 4
 
     wb = load_workbook(xlsx_path)
     wb_values = load_workbook(xlsx_path, data_only=True)
@@ -167,7 +171,6 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     missing_nos = []
     for tool, nos in tool_to_measure_nos.items():
         if tool not in tool_row:
-            # tools にない工具名が map にいたら無視（またはエラーにしたければ raise）
             continue
         tr = tool_row[tool]
         for no in nos:
@@ -176,61 +179,49 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
                 continue
             mr = measure_no_to_row.get(n)
             if mr is None:
-                # 指定した測定Noがシートに無い場合は無視（またはログ化）
                 missing_nos.append((tool, n))
                 continue
             measure_row_to_tool_rows.setdefault(mr, []).append(tr)
 
-    # 4) 依頼関数を投入
+    # 4) 1～3行目に新しい数式を投入、測定行に依頼セルを設定
     written = 0
-    for col_idx in range(flag_col_start, flag_col_end + 1):  # SN列まで含める
+    for col_idx in range(flag_col_start, flag_col_end + 1):
         col_letter = get_column_letter(col_idx)
-        # 指定列の1行目（例: I1）に集計式を投入
-        # 修正版: =SUMPRODUCT((I9:I159<>"")*1,(MOD(ROW(I9:I159)-ROW(I9),2)=0)*1,NOT(ISFORMULA(I9:I159))*1)
-        # ISFORMULAが使えない場合の代替: =SUMPRODUCT((I9:I159<>"")*1,(MOD(ROW(I9:I159)-ROW(I9),2)=0)*1,LEFT(CELL("format",I9:I159),1)="="*0)
-        if summary_row_step <= 0:
-            raise ValueError("summary_row_step は 1 以上を指定してください。")
-        if summary_row_min <= 0 or summary_row_max <= 0:
-            raise ValueError(
-                "summary_row_min/summary_row_max は 1 以上を指定してください。"
-            )
-        if summary_row_min > summary_row_max:
-            raise ValueError(
-                "summary_row_min は summary_row_max 以下を指定してください。"
-            )
-
-        # ISFORMULA関数を完全に削除し、単純な数式に変更
-        # 空でないセルかつ指定ステップの行をカウント
-        # 測定行の範囲（measure_row_min〜measure_row_max）のみをカウントするように修正
-        sumproduct_args = [
-            f'--({col_letter}{measure_row_min}:{col_letter}{measure_row_max}<>"")',
-            f"--(MOD(ROW({col_letter}{measure_row_min}:{col_letter}{measure_row_max})-ROW({col_letter}{measure_row_min}),{measure_row_step})=0)",
-        ]
-
-        # SUMPRODUCT関数を使用
-        sumproduct_formula = f"=SUMPRODUCT({formula_arg_sep.join(sumproduct_args)})"
-
-        # 1行目と2行目に別々の数式を設定
-        # 1行目: ROW(J9) を基準
-        ws.cell(1, col_idx).value = sumproduct_formula
-
-        # 2行目: ROW(J10) を基準にした数式を作成
-        row2_base_row = measure_row_min + 1  # 9 + 1 = 10
-        sumproduct_args_row2 = [
-            f'--({col_letter}{measure_row_min}:{col_letter}{measure_row_max}<>"")',
-            f"--(MOD(ROW({col_letter}{measure_row_min}:{col_letter}{measure_row_max})-ROW({col_letter}{row2_base_row}),{measure_row_step})=0)",
-        ]
-        sumproduct_formula_row2 = (
-            f"=SUMPRODUCT({formula_arg_sep.join(sumproduct_args_row2)})"
+        
+        # 1行目: SEQUENCE(sequence_count,1,11,3) - measure_row_minから開始
+        formula_row1 = (
+            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
+            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
         )
-        ws.cell(2, col_idx).value = sumproduct_formula_row2
+        ws.cell(1, col_idx).value = formula_row1
 
-        # デバッグ用に生成した数式をログ出力（実際の使用ではコメントアウトしてもよい）
-        print(f"列 {col_letter} 1行目: {sumproduct_formula}")
-        print(f"列 {col_letter} 2行目: {sumproduct_formula_row2}")
+        # 2行目: SEQUENCE(sequence_count,1,12,3) - measure_row_min+1から開始
+        formula_row2 = (
+            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 1}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
+            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 1}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
+        )
+        ws.cell(2, col_idx).value = formula_row2
 
+        # 3行目: SEQUENCE(sequence_count,1,13,3) - measure_row_min+2から開始
+        formula_row3 = (
+            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 2}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
+            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 2}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
+        )
+        ws.cell(3, col_idx).value = formula_row3
+
+        # デバッグ用ログ出力
+        print(f"列 {col_letter} 1行目: {formula_row1}")
+        print(f"列 {col_letter} 2行目: {formula_row2}")
+        print(f"列 {col_letter} 3行目: {formula_row3}")
+
+        # 測定行に依頼セルを設定
         for mr, tool_rows in measure_row_to_tool_rows.items():
-            # 例: OR(N$75<>"",N$77<>"")
             conds = ",".join([f'{col_letter}${tr}<>""' for tr in tool_rows])
             ws.cell(mr, col_idx).value = f'=IF(OR({conds}),"依頼","")'
             written += 1
@@ -241,7 +232,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             f"- 読み取れた測定No件数: {len(measure_no_to_row)}\n"
             f"- 工具件数: {len(tools)}\n"
             f"- 逆引き対象の測定行件数: {len(measure_row_to_tool_rows)}\n"
-            "- 出力列: I〜SN（固定）\n"
+            "- 出力列: L～SR（固定）\n"
             f"- 指定Noが見つからない例(先頭10件): {missing_nos[:10]}\n\n"
             "原因候補:\n"
             "1) 測定No列/行範囲が実シートと違う\n"
@@ -261,14 +252,17 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
 
 def _parse_int_list(text: str):
-    if not text.strip():
+    if not text or not text.strip():
         return []
-    parts = [p.strip() for p in text.replace("、", ",").replace(" ", ",").split(",")]
+    parts = re.split(r"[,\s、，;；]+", text.strip())
     nums = []
-    for p in parts:
-        if not p:
+    for part in parts:
+        if not part:
             continue
-        nums.append(int(p))
+        value = _try_extract_int(part)
+        if value is None:
+            raise ValueError(f"測定Noに整数以外の入力が含まれています: '{part}'")
+        nums.append(value)
     return nums
 
 
@@ -276,20 +270,18 @@ def write_measurement_not_required(
     xlsx_path: str,
     out_path: str,
     cfg: dict,
-    target_row: int = 69,
     target_nos: list = None,
     *,
     parent=None,
 ):
     """
-    指定したB列に"測定不要"を書き込み、指定したNo.の行のI列に条件付きで"-"を書き込む
+    工具開始行-3行目のE列に"測定不要"を書き込み、指定したNo.の行のL～SR列に条件付きで"-"を書き込む
 
     Args:
         xlsx_path: 入力Excelファイルのパス
         out_path: 出力Excelファイルのパス
         cfg: 設定辞書（sheet_name, measure_no_col, measure_row_min, measure_row_max を含む）
-        target_row: B列に"測定不要"を書き込む行番号（デフォルト: 69）
-        target_nos: I列に"-"を書き込む対象のNo.リスト（A列から検索）
+        target_nos: L～SR列に"-"を書き込む対象のNo.リスト（A列から検索）
         parent: 親ウィンドウ（エラーメッセージ表示用）
 
     Returns:
@@ -300,8 +292,9 @@ def write_measurement_not_required(
 
     sheet_name = cfg.get("sheet_name", "工程内検査シート")
     measure_no_col = cfg.get("measure_no_col", "A")
-    measure_row_min = int(cfg.get("measure_row_min", 9))
-    measure_row_max = int(cfg.get("measure_row_max", 74))
+    tool_start_row = int(cfg.get("tool_start_row", 200))
+    measure_row_min = int(cfg.get("measure_row_min", 11))
+    measure_row_max = int(cfg.get("measure_row_max", tool_start_row - 4))
 
     wb = load_workbook(xlsx_path)
     wb_values = load_workbook(xlsx_path, data_only=True)
@@ -318,10 +311,23 @@ def write_measurement_not_required(
     no_col = column_index_from_string(measure_no_col)
     measure_no_to_row = {}
     max_r = min(measure_row_max, ws.max_row or measure_row_max)
+    debug_info = []  # デバッグ情報を収集
+    
     for r in range(measure_row_min, max_r + 1):
         v = ws_values.cell(r, no_col).value
+        cell_obj = ws.cell(r, no_col)
+        formula = None
+        
         if v is None:
-            v = ws.cell(r, no_col).value
+            v = cell_obj.value
+            # 数式の場合、数式文字列が返される
+            if isinstance(v, str) and v.startswith('='):
+                formula = v
+        
+        # デバッグ情報を記録（最初の10行のみ）
+        if len(debug_info) < 10:
+            debug_info.append(f"行{r}: 値={v!r}, 型={type(v).__name__}, 数式={formula}")
+        
         if v is None:
             continue
         no = _try_extract_int(v)
@@ -329,37 +335,99 @@ def write_measurement_not_required(
             continue
         measure_no_to_row[no] = r
 
-    # 2) 指定行のB列に"測定不要"を書き込み
-    b_col = column_index_from_string("B")
-    ws.cell(target_row, b_col).value = "測定不要"
+    target_row = tool_start_row - 3
 
-    # 3) 指定したNo.の行のI列に条件付きで"-"を書き込む
-    # 条件: 指定行（target_row）のI列に値が入ると、全ての指定No.の行のI列に"-"が入る
-    i_col = column_index_from_string("I")
-    target_i_cell = get_column_letter(i_col) + str(target_row)
+    # 2) 指定行のE列に"測定不要"を書き込み（工具開始行-3）
+    e_col = column_index_from_string("E")
+    ws.cell(target_row, e_col).value = "測定不要"
+
+    # 3) 指定したNo.の行のL～SR列に条件付きで"-"を書き込む
+    # 条件: 指定行（target_row）の同じ列に値が入ると、該当行のL～SR列に"-"が入る
+    flag_col_start = column_index_from_string("L")
+    flag_col_end = column_index_from_string("SR")
 
     written_count = 0
+    not_found_nos = []
     for no in target_nos:
         row = measure_no_to_row.get(no)
         if row is None:
-            # 指定したNo.が見つからない場合はスキップ（または警告を出す）
+            # 指定したNo.が見つからない場合は記録
+            not_found_nos.append(no)
             continue
 
-        # 条件付き数式: 指定行のI列に値が入ると"-"を表示
-        # =IF(INDIRECT("I"&69)<>"","-","")
-        formula = f'=IF({target_i_cell}<>"","-","")'
-        ws.cell(row, i_col).value = formula
+        for col_idx in range(flag_col_start, flag_col_end + 1):
+            col_letter = get_column_letter(col_idx)
+            target_cell = f"{col_letter}{target_row}"
+            # =IF(L197<>"","-","")
+            formula = f'=IF({target_cell}<>"","-","")'
+            ws.cell(row, col_idx).value = formula
         written_count += 1
 
     if written_count == 0 and target_nos:
+        available_nos = sorted(measure_no_to_row.keys())
+        available_nos_str = ", ".join(map(str, available_nos[:20]))
+        if len(available_nos) > 20:
+            available_nos_str += f" ... (他{len(available_nos) - 20}件)"
+        
+        debug_str = "\n".join(debug_info)
+        
         raise ValueError(
-            f"指定したNo.の行が見つかりませんでした。\n"
-            f"- 指定したNo.: {target_nos}\n"
-            f"- 読み取れた測定No件数: {len(measure_no_to_row)}\n"
-            f"- 測定No範囲: {measure_row_min}〜{measure_row_max}行目"
+            f"指定したNo.の行が見つかりませんでした。\n\n"
+            f"【指定したNo.】\n{target_nos}\n\n"
+            f"【読み取れた測定No】\n{available_nos_str}\n\n"
+            f"【設定】\n"
+            f"- 測定No列: {measure_no_col}列\n"
+            f"- 測定行範囲: {measure_row_min}〜{measure_row_max}行目\n"
+            f"- 読み取れた測定No件数: {len(measure_no_to_row)}件\n\n"
+            f"【デバッグ情報（先頭10行）】\n{debug_str}\n\n"
+            f"※測定Noが数式の場合、Excelで一度ファイルを開いて保存してから再実行してください。"
         )
 
     return _save_workbook_atomic(wb, out_path, parent=parent)
+
+
+class LoadingDialog(tk.Toplevel):
+    """ローディング表示用のダイアログ"""
+    def __init__(self, parent, title="処理中...", message="お待ちください..."):
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.grab_set()
+        
+        # ウィンドウを中央に配置
+        self.geometry("300x120")
+        window_width = 300
+        window_height = 120
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        center_x = int(screen_width / 2 - window_width / 2)
+        center_y = int(screen_height / 2 - window_height / 2)
+        self.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
+        
+        # ウィンドウを閉じるボタンを無効化
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill="both", expand=True)
+        
+        ttk.Label(frame, text=message, font=("", 10)).pack(pady=(10, 15))
+        
+        # プログレスバー
+        self.progress = ttk.Progressbar(
+            frame,
+            mode="indeterminate",
+            length=250
+        )
+        self.progress.pack(pady=10)
+        self.progress.start(10)
+        
+        self.update()
+
+    def close(self):
+        """ダイアログを閉じる"""
+        self.progress.stop()
+        self.grab_release()
+        self.destroy()
 
 
 class ConfigEditor(tb.Window):
@@ -372,22 +440,35 @@ class ConfigEditor(tb.Window):
         except Exception:
             pass
 
+        measure_row_min_default = 11
+        measure_row_step_default = 3
+        tool_start_default = 200
+        measure_row_max_default = max(tool_start_default - 4, measure_row_min_default)
+        summary_row_min_default = measure_row_min_default
+        summary_row_max_default = measure_row_max_default
+        summary_row_step_default = measure_row_step_default
+        tool_row_step_default = measure_row_step_default
+
         self.vars = {
             "sheet_name": tk.StringVar(value="工程内検査シート"),
             "measure_no_col": tk.StringVar(value="A"),
-            "measure_row_min": tk.IntVar(value=9),
-            "measure_row_max": tk.IntVar(value=74),
-            "measure_row_step": tk.IntVar(value=2),
-            "summary_row_min": tk.IntVar(value=9),
-            "summary_row_max": tk.IntVar(value=159),
-            "summary_row_step": tk.IntVar(value=2),
+            "measure_row_min": tk.IntVar(value=measure_row_min_default),
+            "measure_row_max": tk.IntVar(value=measure_row_max_default),
+            "measure_row_step": tk.IntVar(value=measure_row_step_default),
+            "summary_row_min": tk.IntVar(value=summary_row_min_default),
+            "summary_row_max": tk.IntVar(value=summary_row_max_default),
+            "summary_row_step": tk.IntVar(value=summary_row_step_default),
             "formula_arg_sep": tk.StringVar(value=","),
-            "tool_start_row": tk.IntVar(value=75),
-            "tool_name_col": tk.StringVar(value="B"),
-            "tool_row_step": tk.IntVar(value=2),
-            "not_required_row": tk.StringVar(value="69"),
+            "tool_start_row": tk.IntVar(value=tool_start_default),
+            "tool_name_col": tk.StringVar(value="E"),
+            "tool_row_step": tk.IntVar(value=tool_row_step_default),
+            "not_required_row": tk.StringVar(
+                value=str(max(tool_start_default - 3, 1))
+            ),
             "not_required_nos": tk.StringVar(value=""),
         }
+
+        self._bind_basic_setting_sync()
 
         self.selected_xlsx = tk.StringVar(value="")
         self.preview_title = tk.StringVar(value="プレビュー (未読み込み)")
@@ -478,10 +559,18 @@ class ConfigEditor(tb.Window):
         add_field(2, 1, "工具名列", "tool_name_col")
         add_field(3, 1, "工具行ステップ", "tool_row_step")
 
-        ttk.Label(basic, text="出力列: I～SN（固定）").pack(anchor="w", pady=3)
-        ttk.Label(basic_right, text="B列に書き込む行番号:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
-        ttk.Entry(basic_right, textvariable=self.vars["not_required_row"], width=15).grid(row=0, column=1, sticky="w", padx=(0, 30), pady=5)
-        ttk.Label(basic_right, text="I列に'-'を入れるNo.(カンマ区切り):").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Label(basic, text="出力列: L～SR（固定）").pack(anchor="w", pady=3)
+        ttk.Label(basic_right, text="E列 (工具開始行-3) の行番号:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(
+            basic_right,
+            textvariable=self.vars["not_required_row"],
+            width=15,
+            state="readonly",
+        ).grid(row=0, column=1, sticky="w", padx=(0, 30), pady=5)
+        ttk.Label(
+            basic_right,
+            text="L～SR列に'-'を入れるNo.(カンマ区切り):",
+        ).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
         ttk.Entry(basic_right, textvariable=self.vars["not_required_nos"], width=40).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=5)
         basic_right.columnconfigure(1, weight=1)
 
@@ -507,6 +596,54 @@ class ConfigEditor(tb.Window):
         if not self.tools_tree.get_children():
             self._insert_tool("前挽き(サンプル)", "1, 5, 10")
 
+    def _bind_basic_setting_sync(self):
+        self.vars["tool_start_row"].trace_add("write", self._sync_tool_start_row)
+        self.vars["measure_row_min"].trace_add("write", self._sync_measure_row_min)
+        self.vars["measure_row_max"].trace_add("write", self._sync_measure_row_max)
+        self.vars["measure_row_step"].trace_add("write", self._sync_measure_row_step)
+
+    def _sync_tool_start_row(self, *args):
+        try:
+            tool_start = self.vars["tool_start_row"].get()
+        except tk.TclError:
+            return
+        min_row = self.vars["measure_row_min"].get()
+        desired_max = max(tool_start - 4, min_row)
+        if self.vars["measure_row_max"].get() != desired_max:
+            self.vars["measure_row_max"].set(desired_max)
+        target_row = max(tool_start - 3, 1)
+        desired_row_str = str(target_row)
+        if self.vars["not_required_row"].get() != desired_row_str:
+            self.vars["not_required_row"].set(desired_row_str)
+
+    def _sync_measure_row_min(self, *args):
+        try:
+            min_row = self.vars["measure_row_min"].get()
+        except tk.TclError:
+            return
+        self.vars["summary_row_min"].set(min_row)
+        if self.vars["measure_row_max"].get() < min_row:
+            self.vars["measure_row_max"].set(min_row)
+
+    def _sync_measure_row_max(self, *args):
+        try:
+            max_row = self.vars["measure_row_max"].get()
+        except tk.TclError:
+            return
+        self.vars["summary_row_max"].set(max_row)
+
+    def _sync_measure_row_step(self, *args):
+        try:
+            step = self.vars["measure_row_step"].get()
+        except tk.TclError:
+            return
+        if step < 1:
+            self.vars["measure_row_step"].set(1)
+            return
+        self.vars["summary_row_step"].set(step)
+        if self.vars["tool_row_step"].get() != step:
+            self.vars["tool_row_step"].set(step)
+
     def _load_preview(self):
         path = filedialog.askopenfilename(
             parent=self,
@@ -516,98 +653,148 @@ class ConfigEditor(tb.Window):
         if not path:
             return
         self.selected_xlsx.set(path)
-        self._render_preview()
+        
+        # ローディングダイアログを表示して別スレッドでプレビュー読み込み
+        loading = LoadingDialog(self, "読み込み中...", "Excelファイルを読み込んでいます...")
+        
+        result = {"success": False, "error": None}
+        
+        def load_task():
+            try:
+                self._render_preview_internal()
+                result["success"] = True
+            except Exception as e:
+                result["error"] = e
+        
+        thread = threading.Thread(target=load_task, daemon=True)
+        thread.start()
+        
+        # スレッドが完了するまで待機
+        def check_completion():
+            if thread.is_alive():
+                self.after(100, check_completion)
+            else:
+                loading.close()
+                if result["success"]:
+                    pass  # 成功時は何もしない
+                elif result["error"]:
+                    messagebox.showerror("読み込み失敗", str(result["error"]), parent=self)
+        
+        self.after(100, check_completion)
 
     def _render_preview(self):
+        """プレビュー更新ボタン用のラッパー"""
         path = self.selected_xlsx.get().strip()
         if not path:
             messagebox.showinfo("読み込み待ち", "先にExcelファイルを選択してください。", parent=self)
+            return
+        
+        loading = LoadingDialog(self, "更新中...", "プレビューを更新しています...")
+        
+        result = {"success": False, "error": None}
+        
+        def render_task():
+            try:
+                self._render_preview_internal()
+                result["success"] = True
+            except Exception as e:
+                result["error"] = e
+        
+        thread = threading.Thread(target=render_task, daemon=True)
+        thread.start()
+        
+        def check_completion():
+            if thread.is_alive():
+                self.after(100, check_completion)
+            else:
+                loading.close()
+                if result["success"]:
+                    pass
+                elif result["error"]:
+                    messagebox.showerror("更新失敗", str(result["error"]), parent=self)
+        
+        self.after(100, check_completion)
+
+    def _render_preview_internal(self):
+        """実際のプレビュー処理（従来の_render_previewの内容）"""
+        path = self.selected_xlsx.get().strip()
+        if not path:
             return
 
         sheet_name = self.vars["sheet_name"].get().strip() or "工程内検査シート"
         try:
             wb = load_workbook(path, data_only=True)
         except Exception as e:
-            messagebox.showerror("読み込み失敗", f"Excelを開けませんでした。\n{e}", parent=self)
-            return
+            raise Exception(f"Excelを開けませんでした。\n{e}")
 
         if sheet_name not in wb.sheetnames:
-            messagebox.showerror(
-                "シートなし",
-                f"シート「{sheet_name}」が見つかりません。\nシート名を確認して再度プレビューしてください。",
-                parent=self,
+            raise Exception(
+                f"シート「{sheet_name}」が見つかりません。\nシート名を確認して再度プレビューしてください。"
             )
-            return
 
         ws = wb[sheet_name]
         preview_col_indices = [column_index_from_string(c) for c in self.preview_columns]
 
         if not ws.max_row or not ws.max_column:
-            messagebox.showinfo("シートが空です", "表示できるデータがありません。", parent=self)
-            return
+            raise Exception("表示できるデータがありません。")
 
         col_widths = {"A": 80, "B": 120, "G": 140, "K": 140}
-        self.preview_tree.configure(columns=self.preview_columns)
-        for col in self.preview_columns:
-            self.preview_tree.heading(col, text=col, anchor="center")
-            self.preview_tree.column(
-                col,
-                width=col_widths.get(col, 120),
-                minwidth=60,
-                anchor="center",
-                stretch=False,
-            )
+        
+        # UIの更新はメインスレッドで実行
+        def update_ui():
+            self.preview_tree.configure(columns=self.preview_columns)
+            for col in self.preview_columns:
+                self.preview_tree.heading(col, text=col, anchor="center")
+                self.preview_tree.column(
+                    col,
+                    width=col_widths.get(col, 120),
+                    minwidth=60,
+                    anchor="center",
+                    stretch=False,
+                )
 
-        for item in self.preview_tree.get_children():
-            self.preview_tree.delete(item)
-
-        header_row = 10
-        group_size = 3  # 11-13,14-16... の先頭行のみ表示
-        max_row_value = ws.max_row or 0
-
-        if max_row_value < header_row:
-            messagebox.showinfo(
-                "データなし",
-                f"{header_row}行目以降に表示できるデータがありません。",
-                parent=self,
-            )
-            return
-
-        # ヘッダー行(10行目)を挿入
-        header_vals = []
-        for c in preview_col_indices:
-            v = ws.cell(header_row, c).value
-            header_vals.append("" if v is None else str(v))
-        self.preview_tree.insert("", "end", values=header_vals)
-
-        data_start_row = header_row + 1  # 11行目
-        row_count = 0
-        for r in range(data_start_row, max_row_value + 1, group_size):
-            a_val = ws.cell(r, preview_col_indices[0]).value
-            if a_val is None or (isinstance(a_val, str) and not a_val.strip()):
-                break
-
-            row_vals = []
-            for c in preview_col_indices:
-                v = ws.cell(r, c).value
-                row_vals.append("" if v is None else str(v))
-
-            self.preview_tree.insert("", "end", values=row_vals)
-            row_count += 1
-
-        if row_count == 0:
             for item in self.preview_tree.get_children():
                 self.preview_tree.delete(item)
-            messagebox.showinfo(
-                "データなし",
-                "11行目以降の先頭行(A列)が空のため表示できるデータがありません。",
-                parent=self,
-            )
-            return
 
-        self.preview_title.set(
-            f"{sheet_name} プレビュー（{row_count}行: 10行目ヘッダー＋11行目以降3行刻み先頭行）"
-        )
+            header_row = 10
+            group_size = 3
+            max_row_value = ws.max_row or 0
+
+            if max_row_value < header_row:
+                raise Exception(f"{header_row}行目以降に表示できるデータがありません。")
+
+            # ヘッダー行(10行目)を挿入
+            header_vals = []
+            for c in preview_col_indices:
+                v = ws.cell(header_row, c).value
+                header_vals.append("" if v is None else str(v))
+            self.preview_tree.insert("", "end", values=header_vals)
+
+            data_start_row = header_row + 1
+            row_count = 0
+            for r in range(data_start_row, max_row_value + 1, group_size):
+                a_val = ws.cell(r, preview_col_indices[0]).value
+                if a_val is None or (isinstance(a_val, str) and not a_val.strip()):
+                    break
+
+                row_vals = []
+                for c in preview_col_indices:
+                    v = ws.cell(r, c).value
+                    row_vals.append("" if v is None else str(v))
+
+                self.preview_tree.insert("", "end", values=row_vals)
+                row_count += 1
+
+            if row_count == 0:
+                for item in self.preview_tree.get_children():
+                    self.preview_tree.delete(item)
+                raise Exception("11行目以降の先頭行(A列)が空のため表示できるデータがありません。")
+
+            self.preview_title.set(
+                f"{sheet_name} プレビュー（{row_count}行: 10行目ヘッダー＋11行目以降3行刻み先頭行）"
+            )
+        
+        self.after(0, update_ui)
 
     def _insert_tool(self, tool_name: str, nos_text: str):
         self.tools_tree.insert("", "end", values=(tool_name, nos_text))
@@ -761,56 +948,61 @@ class ConfigEditor(tb.Window):
         if not out_path:
             return
 
-        try:
-            saved_path = build_request_formulas(xlsx, out_path, cfg, parent=self)
-        except Exception as e:
-            messagebox.showerror("失敗", str(e), parent=self)
-            return
-
-        # 測定不要書き込み設定が入力されている場合は実行
-        try:
-            not_required_nos_text = self.vars["not_required_nos"].get().strip()
-            if not_required_nos_text:
-                try:
-                    target_row = int(self.vars["not_required_row"].get().strip())
-                    if target_row < 1:
-                        raise ValueError("行番号は1以上を指定してください。")
-                except ValueError as e:
-                    messagebox.showerror(
-                        "入力エラー", f"行番号の入力が不正です。\n{e}", parent=self
-                    )
-                    return
-
-                try:
-                    target_nos = _parse_int_list(not_required_nos_text)
-                except Exception as e:
-                    messagebox.showerror(
-                        "入力エラー",
-                        f"測定Noの入力が不正です。\n{e}",
-                        parent=self,
-                    )
-                    return
-
-                if target_nos:
-                    # 同じファイルに対して測定不要書き込みを実行
-                    saved_path = write_measurement_not_required(
-                        saved_path,  # 既に生成されたファイルを使用
-                        out_path,  # 同じ出力先に上書き
-                        cfg,
-                        target_row=target_row,
-                        target_nos=target_nos,
-                        parent=self,
-                    )
-        except Exception as e:
-            # 測定不要書き込みでエラーが発生しても、メイン処理は成功しているので警告のみ
-            messagebox.showwarning(
-                "警告",
-                f"Excel生成は完了しましたが、測定不要書き込みでエラーが発生しました:\n{e}",
-                parent=self,
-            )
-            return
-
-        messagebox.showinfo("完了", f"生成しました:\n{saved_path}", parent=self)
+        # ローディングダイアログを表示して別スレッドで生成処理
+        loading = LoadingDialog(self, "生成中...", "Excelファイルを生成しています...")
+        
+        result = {"success": False, "error": None, "saved_path": None}
+        
+        def build_task():
+            try:
+                saved_path = build_request_formulas(xlsx, out_path, cfg, parent=self)
+                result["saved_path"] = saved_path
+                
+                # 測定不要書き込み設定が入力されている場合は実行
+                not_required_nos_text = self.vars["not_required_nos"].get().strip()
+                if not_required_nos_text:
+                    try:
+                        target_nos = _parse_int_list(not_required_nos_text)
+                        if target_nos:
+                            saved_path = write_measurement_not_required(
+                                saved_path,
+                                out_path,
+                                cfg,
+                                target_nos=target_nos,
+                                parent=self,
+                            )
+                            result["saved_path"] = saved_path
+                    except Exception as e:
+                        result["error"] = f"測定不要書き込みでエラーが発生しました:\n{e}"
+                        result["success"] = True  # メイン処理は成功
+                        return
+                
+                result["success"] = True
+            except Exception as e:
+                result["error"] = str(e)
+        
+        thread = threading.Thread(target=build_task, daemon=True)
+        thread.start()
+        
+        def check_completion():
+            if thread.is_alive():
+                self.after(100, check_completion)
+            else:
+                loading.close()
+                if result["success"]:
+                    if result["error"]:
+                        # 警告メッセージ
+                        messagebox.showwarning(
+                            "警告",
+                            f"Excel生成は完了しましたが、{result['error']}",
+                            parent=self,
+                        )
+                    else:
+                        messagebox.showinfo("完了", f"生成しました:\n{result['saved_path']}", parent=self)
+                else:
+                    messagebox.showerror("失敗", result["error"], parent=self)
+        
+        self.after(100, check_completion)
 
     def _run_write_not_required(self):
         """測定不要書き込み機能の実行"""
@@ -821,16 +1013,6 @@ class ConfigEditor(tb.Window):
             return
 
         # UI内の入力フィールドから値を取得
-        try:
-            target_row = int(self.vars["not_required_row"].get().strip())
-            if target_row < 1:
-                raise ValueError("行番号は1以上を指定してください。")
-        except ValueError as e:
-            messagebox.showerror(
-                "入力エラー", f"行番号の入力が不正です。\n{e}", parent=self
-            )
-            return
-
         try:
             target_nos = _parse_int_list(self.vars["not_required_nos"].get())
         except Exception as e:
@@ -843,7 +1025,9 @@ class ConfigEditor(tb.Window):
 
         if not target_nos:
             messagebox.showwarning(
-                "入力不足", "I列に'-'を入れるNo.を入力してください。", parent=self
+                "入力不足",
+                "L～SR列に'-'を入れるNo.を入力してください。",
+                parent=self,
             )
             return
 
@@ -872,7 +1056,6 @@ class ConfigEditor(tb.Window):
                 xlsx,
                 out_path,
                 cfg,
-                target_row=target_row,
                 target_nos=target_nos,
                 parent=self,
             )
@@ -931,8 +1114,8 @@ class ConfigEditor(tb.Window):
 3. 「選択編集」「選択削除」で既存の工具を編集・削除できます
 
 【測定不要書き込み設定】
-1. B列に「測定不要」を書き込む行番号を指定します
-2. I列に「-」を入れる測定Noをカンマ区切りで指定します
+1. 工具開始行-3行目のE列に「測定不要」が自動で書き込まれます
+2. L～SR列に「-」を入れる測定Noをカンマ区切りで指定します
 3. この設定は任意です（空欄の場合はスキップされます）
 
 【Excel生成】
@@ -943,7 +1126,7 @@ class ConfigEditor(tb.Window):
 
 【生成される内容】
 - 指定した工具に対応する測定Noの行に「依頼」という文字が自動入力されます
-- I列からSN列までの各列に対して処理が実行されます
+- L列からSR列までの各列に対して処理が実行されます
 - 測定不要設定が指定されている場合は、該当する行に「測定不要」や「-」が書き込まれます
         """
 
