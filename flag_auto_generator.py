@@ -1,8 +1,10 @@
 import os
 import re
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 
+import ttkbootstrap as tb
+from ttkbootstrap import ttk
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
 
@@ -360,9 +362,9 @@ def write_measurement_not_required(
     return _save_workbook_atomic(wb, out_path, parent=parent)
 
 
-class ConfigEditor(tk.Tk):
+class ConfigEditor(tb.Window):
     def __init__(self):
-        super().__init__()
+        super().__init__(themename="darkly")
         self.title("検査シート 設定作成")
         self.geometry("820x640")
         try:
@@ -387,34 +389,60 @@ class ConfigEditor(tk.Tk):
             "not_required_nos": tk.StringVar(value=""),
         }
 
+        self.selected_xlsx = tk.StringVar(value="")
+        self.preview_title = tk.StringVar(value="プレビュー (未読み込み)")
+
         self._build_ui()
 
     def _build_ui(self):
-        # ヘッダーフレーム（右上にヘルプボタンを配置）
         header_frame = ttk.Frame(self)
         header_frame.pack(fill="x", padx=10, pady=(10, 0))
-
-        # 右上にヘルプボタンを配置
-        help_btn = ttk.Button(header_frame, text="ヘルプ", command=self._show_help)
-        help_btn.pack(side="right")
+        ttk.Button(header_frame, text="ヘルプ", command=self._show_help).pack(side="right")
 
         main = ttk.Frame(self, padding=10)
         main.pack(fill="both", expand=True)
 
+        # 元Excel読み込み＆プレビュー
+        source_frame = ttk.LabelFrame(main, text="元Excelとプレビュー", padding=10)
+        source_frame.pack(fill="both", expand=True)
+
+        src_row = ttk.Frame(source_frame)
+        src_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(src_row, text="元Excelファイル").pack(side="left")
+        ttk.Entry(src_row, textvariable=self.selected_xlsx, width=60, state="readonly").pack(side="left", padx=6)
+        ttk.Button(src_row, text="Excelを選択", command=self._load_preview).pack(side="left")
+        ttk.Button(src_row, text="プレビュー更新", command=self._render_preview).pack(side="left", padx=6)
+        ttk.Label(src_row, textvariable=self.preview_title).pack(side="right")
+
+        preview_container = ttk.Frame(source_frame)
+        preview_container.pack(fill="both", expand=True)
+        self.preview_columns = ("A", "B", "G", "K")
+        self.preview_tree = ttk.Treeview(
+            preview_container, columns=self.preview_columns, show="headings", height=8
+        )
+        vsb = ttk.Scrollbar(preview_container, orient="vertical", command=self.preview_tree.yview)
+        self.preview_tree.configure(yscrollcommand=vsb.set)
+        self.preview_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+
         basic = ttk.LabelFrame(main, text="基本設定", padding=10)
-        basic.pack(fill="x")
+        basic.pack(fill="x", pady=(10, 0))
+
+        basic_inner = ttk.Frame(basic)
+        basic_inner.pack(fill="x")
+        basic_inner.columnconfigure(0, weight=1)
+        basic_inner.columnconfigure(1, weight=1)
+
+        basic_left = ttk.Frame(basic_inner)
+        basic_left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        basic_right = ttk.LabelFrame(basic_inner, text="測定不要書き込み設定", padding=10)
+        basic_right.grid(row=0, column=1, sticky="nsew")
 
         def add_field(row, col, label, key, width=12):
-            """2列レイアウト用のフィールド追加関数"""
-            col_offset = col * 2  # 各列は2カラム（ラベル+入力）を使用
-            ttk.Label(basic, text=label).grid(
-                row=row, column=col_offset, sticky="w", padx=(0, 8), pady=3
-            )
-            ttk.Entry(basic, textvariable=self.vars[key], width=width).grid(
-                row=row, column=col_offset + 1, sticky="w", padx=(0, 20), pady=3
-            )
+            col_offset = col * 2
+            ttk.Label(basic_left, text=label).grid(row=row, column=col_offset, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(basic_left, textvariable=self.vars[key], width=width).grid(row=row, column=col_offset + 1, sticky="w", padx=(0, 20), pady=3)
 
-        # 左列（col=0）
         add_field(0, 0, "シート名", "sheet_name", width=25)
         add_field(1, 0, "測定No列", "measure_no_col")
         add_field(2, 0, "測定行(min)", "measure_row_min")
@@ -423,84 +451,110 @@ class ConfigEditor(tk.Tk):
         add_field(5, 0, "集計行(min)", "summary_row_min")
         add_field(6, 0, "集計行(max)", "summary_row_max")
         add_field(7, 0, "集計行ステップ", "summary_row_step")
-
-        # 右列（col=1）
         add_field(0, 1, "数式区切り(, / ;)", "formula_arg_sep")
         add_field(1, 1, "工具開始行", "tool_start_row")
         add_field(2, 1, "工具名列", "tool_name_col")
         add_field(3, 1, "工具行ステップ", "tool_row_step")
 
-        # 出力列の表示（全列にまたがる）
-        ttk.Label(basic, text="出力列: I〜SN（固定）").grid(
-            row=8, column=0, columnspan=4, sticky="w", pady=3
-        )
+        ttk.Label(basic, text="出力列: I～SN（固定）").pack(anchor="w", pady=3)
+        ttk.Label(basic_right, text="B列に書き込む行番号:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(basic_right, textvariable=self.vars["not_required_row"], width=15).grid(row=0, column=1, sticky="w", padx=(0, 30), pady=5)
+        ttk.Label(basic_right, text="I列に'-'を入れるNo.(カンマ区切り):").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(basic_right, textvariable=self.vars["not_required_nos"], width=40).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=5)
+        basic_right.columnconfigure(1, weight=1)
 
         tools_frame = ttk.LabelFrame(main, text="工具と測定No対応", padding=10)
         tools_frame.pack(fill="both", expand=True, pady=(10, 0))
-
-        self.tools_tree = ttk.Treeview(
-            tools_frame,
-            columns=("tool", "nos"),
-            show="headings",
-            height=12,
-        )
+        self.tools_tree = ttk.Treeview(tools_frame, columns=("tool", "nos"), show="headings", height=12)
         self.tools_tree.heading("tool", text="工具名")
         self.tools_tree.heading("nos", text="測定No(カンマ区切り)")
         self.tools_tree.column("tool", width=220, anchor="w")
         self.tools_tree.column("nos", width=420, anchor="w")
         self.tools_tree.pack(side="left", fill="both", expand=True)
-
-        scrollbar = ttk.Scrollbar(
-            tools_frame, orient="vertical", command=self.tools_tree.yview
-        )
+        scrollbar = ttk.Scrollbar(tools_frame, orient="vertical", command=self.tools_tree.yview)
         self.tools_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
 
-        # 測定不要書き込み設定セクション（既存の入力部分と明確に分離）
-        not_required_frame = ttk.LabelFrame(
-            main, text="測定不要書き込み設定", padding=10
-        )
-        not_required_frame.pack(fill="x", pady=(10, 0))
-
-        not_required_inner = ttk.Frame(not_required_frame)
-        not_required_inner.pack(fill="x")
-
-        ttk.Label(not_required_inner, text="B列に書き込む行番号:").grid(
-            row=0, column=0, sticky="w", padx=(0, 10), pady=5
-        )
-        ttk.Entry(
-            not_required_inner, textvariable=self.vars["not_required_row"], width=15
-        ).grid(row=0, column=1, sticky="w", padx=(0, 30), pady=5)
-
-        ttk.Label(not_required_inner, text="I列に'-'を入れるNo.(カンマ区切り):").grid(
-            row=0, column=2, sticky="w", padx=(0, 10), pady=5
-        )
-        ttk.Entry(
-            not_required_inner, textvariable=self.vars["not_required_nos"], width=40
-        ).grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=5)
-
-        not_required_inner.columnconfigure(3, weight=1)
-
         btns = ttk.Frame(main)
         btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="工具追加", command=self._add_tool_dialog).pack(side="left")
+        ttk.Button(btns, text="選択編集", command=self._edit_selected_tool).pack(side="left", padx=5)
+        ttk.Button(btns, text="選択削除", command=self._delete_selected_tool).pack(side="left")
+        ttk.Button(btns, text="この設定でExcel生成", command=self._run_build).pack(side="right")
 
-        ttk.Button(btns, text="工具追加", command=self._add_tool_dialog).pack(
-            side="left"
-        )
-        ttk.Button(btns, text="選択編集", command=self._edit_selected_tool).pack(
-            side="left", padx=5
-        )
-        ttk.Button(btns, text="選択削除", command=self._delete_selected_tool).pack(
-            side="left"
-        )
-
-        ttk.Button(btns, text="この設定でExcel生成", command=self._run_build).pack(
-            side="right"
-        )
-
-        # 初期のサンプル行（空なら）
         if not self.tools_tree.get_children():
             self._insert_tool("前挽き(サンプル)", "1, 5, 10")
+
+    def _load_preview(self):
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="元の検査シート（xlsx）を選択",
+            filetypes=[("Excel", "*.xlsx")],
+        )
+        if not path:
+            return
+        self.selected_xlsx.set(path)
+        self._render_preview()
+
+    def _render_preview(self):
+        path = self.selected_xlsx.get().strip()
+        if not path:
+            messagebox.showinfo("読み込み待ち", "先にExcelファイルを選択してください。", parent=self)
+            return
+
+        sheet_name = self.vars["sheet_name"].get().strip() or "工程内検査シート"
+        try:
+            wb = load_workbook(path, data_only=True)
+        except Exception as e:
+            messagebox.showerror("読み込み失敗", f"Excelを開けませんでした。\n{e}", parent=self)
+            return
+
+        if sheet_name not in wb.sheetnames:
+            messagebox.showerror(
+                "シートなし",
+                f"シート「{sheet_name}」が見つかりません。\nシート名を確認して再度プレビューしてください。",
+                parent=self,
+            )
+            return
+
+        ws = wb[sheet_name]
+        preview_col_indices = [column_index_from_string(c) for c in self.preview_columns]
+
+        if not ws.max_row or not ws.max_column:
+            messagebox.showinfo("シートが空です", "表示できるデータがありません。", parent=self)
+            return
+
+        self.preview_tree.configure(columns=self.preview_columns)
+        for col in self.preview_columns:
+            self.preview_tree.heading(col, text=col)
+            self.preview_tree.column(col, width=120, anchor="w")
+
+        for item in self.preview_tree.get_children():
+            self.preview_tree.delete(item)
+
+        row_count = 0
+        for r in range(1, (ws.max_row or 0) + 1):
+            a_val = ws.cell(r, preview_col_indices[0]).value
+            if a_val is None or (isinstance(a_val, str) and not a_val.strip()):
+                break
+
+            row_vals = []
+            for c in preview_col_indices:
+                v = ws.cell(r, c).value
+                row_vals.append("" if v is None else str(v))
+
+            self.preview_tree.insert("", "end", values=row_vals)
+            row_count += 1
+
+        if row_count == 0:
+            messagebox.showinfo(
+                "データなし",
+                "A列が空のため表示できる行がありません。",
+                parent=self,
+            )
+            return
+
+        self.preview_title.set(f"{sheet_name} プレビュー（{row_count}行: A列が空になるまで）")
 
     def _insert_tool(self, tool_name: str, nos_text: str):
         self.tools_tree.insert("", "end", values=(tool_name, nos_text))
@@ -634,11 +688,17 @@ class ConfigEditor(tk.Tk):
             messagebox.showerror("失敗", str(e), parent=self)
             return
 
-        xlsx = pick_file(
-            "元の検査シート（xlsx）を選択", [("Excel", "*.xlsx")], parent=self
-        )
+        xlsx = self.selected_xlsx.get().strip()
         if not xlsx:
-            return
+            messagebox.showinfo(
+                "ファイル未選択",
+                "先に「Excelを選択」で元ファイルを読み込んでください。",
+                parent=self,
+            )
+            self._load_preview()
+            xlsx = self.selected_xlsx.get().strip()
+            if not xlsx:
+                return
         out_path = pick_save_path(
             "出力先（生成したxlsx）を保存",
             ".xlsx",
@@ -734,11 +794,17 @@ class ConfigEditor(tk.Tk):
             )
             return
 
-        xlsx = pick_file(
-            "元の検査シート（xlsx）を選択", [("Excel", "*.xlsx")], parent=self
-        )
+        xlsx = self.selected_xlsx.get().strip()
         if not xlsx:
-            return
+            messagebox.showinfo(
+                "ファイル未選択",
+                "先に「Excelを選択」で元ファイルを読み込んでください。",
+                parent=self,
+            )
+            self._load_preview()
+            xlsx = self.selected_xlsx.get().strip()
+            if not xlsx:
+                return
         out_path = pick_save_path(
             "出力先（生成したxlsx）を保存",
             ".xlsx",
@@ -771,7 +837,7 @@ class ConfigEditor(tk.Tk):
         help_window.geometry("600x500")
 
         # スクロール可能なフレーム
-        canvas = tk.Canvas(help_window)
+        canvas = tk.Canvas(help_window, highlightthickness=0, bd=0)
         scrollbar = ttk.Scrollbar(help_window, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
 
@@ -829,7 +895,10 @@ class ConfigEditor(tk.Tk):
         """
 
         usage_label = ttk.Label(
-            usage_frame, text=usage_text.strip(), justify="left", font=("", 9)
+            usage_frame,
+            text=usage_text.strip(),
+            justify="left",
+            font=("", 9),
         )
         usage_label.pack(anchor="w", padx=5)
 
@@ -849,7 +918,7 @@ class ConfigEditor(tk.Tk):
             text=note_text.strip(),
             justify="left",
             font=("", 9),
-            foreground="darkred",
+            foreground="firebrick",
         )
         note_label.pack(anchor="w", padx=5)
 
