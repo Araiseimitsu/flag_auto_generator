@@ -1,5 +1,6 @@
 ﻿import os
 import re
+import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
@@ -9,6 +10,16 @@ from ttkbootstrap import ttk
 from ttkbootstrap.scrolled import ScrolledFrame
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
+
+# Excel COM オートメーション（Windows環境でファイル破損を防ぐため）
+# openpyxlで保存すると元の数式が配列数式になる問題があるため、
+# Excel COMでの処理をデフォルトで有効にする
+USE_EXCEL_COM_FOR_SAVE = True
+try:
+    import win32com.client
+    HAS_WIN32COM = True
+except ImportError:
+    HAS_WIN32COM = False
 
 
 def pick_file(title: str, filetypes, parent=None):
@@ -81,6 +92,236 @@ def _save_workbook_atomic(wb, out_path: str, parent=None) -> str:
                     pass
 
 
+def _recalculate_with_excel_com(xlsx_path: str, sheet_name: str = None, fix_range: str = None, parent=None) -> bool:
+    """
+    Excel COMでファイルを開いて数式を再計算し、キャッシュ値を保存する
+    配列数式の問題も解決する（数式を再入力して{}を外す）
+    
+    Args:
+        xlsx_path: Excelファイルパス
+        sheet_name: 対象シート名（指定時のみ処理）
+        fix_range: 配列数式を修正する範囲（例: "A11:K196"）
+        parent: 親ウィンドウ
+    
+    Returns:
+        成功した場合True
+    """
+    if not HAS_WIN32COM:
+        return False
+    
+    xlsx_path = os.path.abspath(xlsx_path)
+    excel = None
+    wb = None
+    try:
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        
+        wb = excel.Workbooks.Open(xlsx_path)
+        
+        # 指定されたシートの配列数式を修正
+        if sheet_name and fix_range:
+            try:
+                ws = wb.Sheets(sheet_name)
+                rng = ws.Range(fix_range)
+                
+                # 各セルの数式を再入力して配列数式フラグを外す
+                for cell in rng:
+                    try:
+                        formula = cell.Formula
+                        # 数式がある場合のみ再設定
+                        if formula and isinstance(formula, str) and formula.startswith('='):
+                            # 数式を一度クリアして再設定（配列数式を解除）
+                            cell.Formula = formula
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        
+        # 全ブックの数式を完全に再構築
+        excel.CalculateFullRebuild()
+        
+        wb.Save()
+        return True
+    except Exception:
+        return False
+    finally:
+        if wb:
+            try:
+                wb.Close(False)
+            except Exception:
+                pass
+        if excel:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+
+
+def _save_with_excel_com(xlsx_path: str, out_path: str, cell_changes: list, sheet_name: str, parent=None) -> str:
+    """
+    Excel COMオートメーションでセルに値を書き込む（高速版）
+    元の数式を壊さず、図形・外部リンクも保持
+    
+    Args:
+        xlsx_path: 元のExcelファイルパス
+        out_path: 出力ファイルパス
+        cell_changes: [(row, col, value), ...] の変更リスト
+        sheet_name: シート名
+        parent: 親ウィンドウ
+    
+    Returns:
+        保存されたファイルのパス
+    """
+    print(f"[DEBUG] Excel COM保存開始: {len(cell_changes)}件のセル変更")
+    
+    xlsx_path = os.path.abspath(xlsx_path)
+    out_path = os.path.abspath(out_path)
+    
+    # 元ファイルと出力先が異なる場合はコピー
+    if xlsx_path != out_path:
+        print(f"[DEBUG] ファイルコピー: {xlsx_path} → {out_path}")
+        shutil.copy2(xlsx_path, out_path)
+    
+    excel = None
+    wb = None
+    try:
+        print("[DEBUG] Excel起動中...")
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.ScreenUpdating = False  # 画面更新を無効化（高速化）
+        
+        print(f"[DEBUG] ワークブックを開く: {out_path}")
+        wb = excel.Workbooks.Open(out_path)
+        ws = wb.Sheets(sheet_name)
+        
+        print(f"[DEBUG] セル書き込み開始（Range一括書き込みで高速化）...")
+        # 列ごとにグループ化
+        col_changes = {}
+        for row, col, value in cell_changes:
+            if col not in col_changes:
+                col_changes[col] = {}
+            col_changes[col][row] = value
+        
+        print(f"[DEBUG] {len(col_changes)}列に対して書き込みを実行")
+        
+        # 列ごとにRange一括書き込み（超高速）
+        col_count = 0
+        for col, row_values in col_changes.items():
+            col_count += 1
+            col_letter = get_column_letter(col)
+            rows = sorted(row_values.keys())
+            if not rows:
+                continue
+            
+            if col_count % 10 == 0:
+                print(f"[DEBUG] {col_count}/{len(col_changes)}列目 ({col_letter}列) 処理中...")
+            
+            min_row = rows[0]
+            max_row = rows[-1]
+            
+            # 連続した範囲として書き込み（最高速）
+            if len(rows) == max_row - min_row + 1:
+                # 全て連続している場合
+                try:
+                    rng = ws.Range(ws.Cells(min_row, col), ws.Cells(max_row, col))
+                    values = [[row_values[r]] for r in rows]
+                    rng.Value = values
+                except Exception as e:
+                    print(f"[WARN] {col_letter}列の一括書き込み失敗、個別書き込みに切替: {e}")
+                    for row in rows:
+                        ws.Cells(row, col).Value = row_values[row]
+            else:
+                # 歯抜けがある場合は個別に書き込み
+                for row in rows:
+                    ws.Cells(row, col).Value = row_values[row]
+        
+        print(f"[DEBUG] 全{len(col_changes)}列の書き込み完了")
+        
+        print(f"[DEBUG] 保存中...")
+        excel.ScreenUpdating = True
+        wb.Save()
+        print(f"[DEBUG] Excel COM保存完了")
+        return out_path
+    except Exception as e:
+        print(f"[ERROR] Excel COM保存失敗: {e}")
+        if parent:
+            messagebox.showerror(
+                "Excel COM エラー",
+                f"Excelでファイルを操作中にエラーが発生しました。\n\n{e}",
+                parent=parent,
+            )
+        raise
+    finally:
+        if wb:
+            try:
+                wb.Close(False)
+            except Exception:
+                pass
+        if excel:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+
+
+def _read_cell_values_with_excel_com(xlsx_path: str, sheet_name: str, col: int, row_min: int, row_max: int) -> dict:
+    """
+    Excel COMで数式の計算結果を読み取る（高速）
+    
+    Args:
+        xlsx_path: Excelファイルパス
+        sheet_name: シート名
+        col: 列番号（1-indexed）
+        row_min: 開始行（1-indexed）
+        row_max: 終了行（1-indexed）
+    
+    Returns:
+        {行番号: 値} の辞書
+    """
+    xlsx_path = os.path.abspath(xlsx_path)
+    excel = None
+    wb = None
+    result = {}
+    try:
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        
+        wb = excel.Workbooks.Open(xlsx_path, ReadOnly=True)
+        ws = wb.Sheets(sheet_name)
+        
+        # 範囲を一括で取得（高速）
+        rng = ws.Range(ws.Cells(row_min, col), ws.Cells(row_max, col))
+        values = rng.Value
+        
+        # 単一セルの場合は配列でなく値が返る
+        if row_min == row_max:
+            result[row_min] = values
+        elif values:
+            for i, val in enumerate(values):
+                if isinstance(val, tuple):
+                    result[row_min + i] = val[0]
+                else:
+                    result[row_min + i] = val
+        
+        return result
+    except Exception:
+        return {}
+    finally:
+        if wb:
+            try:
+                wb.Close(False)
+            except Exception:
+                pass
+        if excel:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+
+
 def _try_extract_int(value):
     if value is None:
         return None
@@ -122,7 +363,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     summary_row_step = int(cfg.get("summary_row_step", measure_row_step))
     formula_arg_sep = str(cfg.get("formula_arg_sep", ",")).strip() or ","
     flag_col_start = column_index_from_string("L")
-    flag_col_end = column_index_from_string("SR")
+    flag_col_end = column_index_from_string("L")  # L列のみ書き込み（M~SR列は手動コピー）
 
     tool_name_col = cfg.get("tool_name_col", "E")
     tool_row_step = int(cfg.get("tool_row_step", measure_row_step))
@@ -148,7 +389,8 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     # SEQUENCE関数の第1引数として使用する値を計算（工具開始行-4）
     sequence_count = tool_start_row - 4
 
-    wb = load_workbook(xlsx_path)
+    # openpyxlで読み込み（分析用）
+    wb = load_workbook(xlsx_path, rich_text=True)
     wb_values = load_workbook(xlsx_path, data_only=True)
     if sheet_name not in wb.sheetnames:
         raise ValueError(
@@ -165,10 +407,29 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     no_col = column_index_from_string(measure_no_col)
     measure_no_to_row = {}
     max_r = min(measure_row_max, ws.max_row or measure_row_max)
+    
+    # openpyxlで値を取得できない場合（数式でキャッシュがない場合）はExcel COMで読み取り
+    com_values = {}
+    needs_com = False
     for r in range(measure_row_min, max_r + 1):
         v = ws_values.cell(r, no_col).value
         if v is None:
-            v = ws.cell(r, no_col).value
+            raw = ws.cell(r, no_col).value
+            if isinstance(raw, str) and raw.startswith('='):
+                needs_com = True
+                break
+    
+    if needs_com and HAS_WIN32COM:
+        com_values = _read_cell_values_with_excel_com(xlsx_path, sheet_name, no_col, measure_row_min, max_r)
+    
+    for r in range(measure_row_min, max_r + 1):
+        v = ws_values.cell(r, no_col).value
+        if v is None:
+            # Excel COMの値を優先
+            if r in com_values:
+                v = com_values[r]
+            else:
+                v = ws.cell(r, no_col).value
         if v is None:
             continue
         no = _try_extract_int(v)
@@ -176,12 +437,15 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             continue
         measure_no_to_row[no] = r
 
+    # 変更リストを収集（row, col, value）
+    cell_changes = []
+
     # 2) 工具名を書き込み & 工具名 → 行番号
     tool_row = {}
     tool_name_c = column_index_from_string(tool_name_col)
     r = tool_start_row
     for tool in tools:
-        ws.cell(r, tool_name_c).value = tool
+        cell_changes.append((r, tool_name_c, tool))
         tool_row[tool] = r
         r += tool_row_step
 
@@ -215,16 +479,16 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
                 f"--(MOD(ROW({rng})-{start_row}{formula_arg_sep}{measure_row_step})=0))"
             )
 
-        ws.cell(1, col_idx).value = _count_formula(measure_row_min)
-        ws.cell(2, col_idx).value = _count_formula(measure_row_min + 1)
-        ws.cell(3, col_idx).value = _count_formula(measure_row_min + 2)
+        cell_changes.append((1, col_idx, _count_formula(measure_row_min)))
+        cell_changes.append((2, col_idx, _count_formula(measure_row_min + 1)))
+        cell_changes.append((3, col_idx, _count_formula(measure_row_min + 2)))
 
         # 測定行に依頼セルを設定
         for mr, tool_rows in measure_row_to_tool_rows.items():
+            # 工具行のいずれかに値が入っていれば「依頼」
             conds = f"{formula_arg_sep}".join([f'{col_letter}${tr}<>""' for tr in tool_rows])
-            ws.cell(mr, col_idx).value = (
-                f'=IF(OR({conds}){formula_arg_sep}"依頼"{formula_arg_sep}""")'
-            )
+            formula = f'=IF(OR({conds}){formula_arg_sep}"依頼"{formula_arg_sep}"")'
+            cell_changes.append((mr, col_idx, formula))
             written += 1
 
     if written == 0:
@@ -241,6 +505,21 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             "3) tool_to_measure_nos のNoがシートに存在しない"
         )
 
+    # openpyxlのワークブックを閉じる
+    wb.close()
+    wb_values.close()
+
+    # Excel COMで保存（元の数式を壊さない）
+    if HAS_WIN32COM and USE_EXCEL_COM_FOR_SAVE:
+        saved = _save_with_excel_com(xlsx_path, out_path, cell_changes, sheet_name, parent=parent)
+        return saved, measure_no_to_row
+    
+    # フォールバック: openpyxlで書き込み（元の数式が配列数式になる可能性あり）
+    wb = load_workbook(xlsx_path, rich_text=True)
+    ws = wb[sheet_name]
+    for row, col, value in cell_changes:
+        ws.cell(row, col).value = value
+
     try:
         wb.calculation.calcMode = "auto"
         wb.calculation.fullCalcOnLoad = True
@@ -249,7 +528,8 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     except Exception:
         pass
 
-    return _save_workbook_atomic(wb, out_path, parent=parent)
+    saved = _save_workbook_atomic(wb, out_path, parent=parent)
+    return saved, measure_no_to_row
 
 
 def _parse_int_list(text: str):
@@ -272,6 +552,7 @@ def write_measurement_not_required(
     out_path: str,
     cfg: dict,
     target_nos: list = None,
+    measure_no_to_row: dict = None,
     *,
     parent=None,
 ):
@@ -283,6 +564,7 @@ def write_measurement_not_required(
         out_path: 出力Excelファイルのパス
         cfg: 設定辞書（sheet_name, measure_no_col, measure_row_min, measure_row_max を含む）
         target_nos: L～SR列に"-"を書き込む対象のNo.リスト（A列から検索）
+        measure_no_to_row: 測定No→行番号のマッピング（build_request_formulasから渡される）
         parent: 親ウィンドウ（エラーメッセージ表示用）
 
     Returns:
@@ -297,8 +579,8 @@ def write_measurement_not_required(
     measure_row_min = int(cfg.get("measure_row_min", 11))
     measure_row_max = int(cfg.get("measure_row_max", tool_start_row - 4))
 
-    wb = load_workbook(xlsx_path)
-    wb_values = load_workbook(xlsx_path, data_only=True)
+    # openpyxlで読み込み（書き込み用）
+    wb = load_workbook(xlsx_path, rich_text=True)
 
     if sheet_name not in wb.sheetnames:
         raise ValueError(
@@ -306,46 +588,42 @@ def write_measurement_not_required(
         )
 
     ws = wb[sheet_name]
-    ws_values = wb_values[sheet_name]
 
-    # 1) 測定No(A列の整数) → 行番号のマッピングを作成
-    no_col = column_index_from_string(measure_no_col)
-    measure_no_to_row = {}
-    max_r = min(measure_row_max, ws.max_row or measure_row_max)
-    debug_info = []  # デバッグ情報を収集
-    
-    for r in range(measure_row_min, max_r + 1):
-        v = ws_values.cell(r, no_col).value
-        cell_obj = ws.cell(r, no_col)
-        formula = None
+    # measure_no_to_rowが渡されていない場合のみ読み取り
+    # （通常はbuild_request_formulasから渡されるので不要）
+    if measure_no_to_row is None:
+        measure_no_to_row = {}
+        no_col = column_index_from_string(measure_no_col)
+        max_r = min(measure_row_max, ws.max_row or measure_row_max)
         
-        if v is None:
-            v = cell_obj.value
-            # 数式の場合、数式文字列が返される
-            if isinstance(v, str) and v.startswith('='):
-                formula = v
+        # Excel COMで読み取り（数式の計算結果を取得）
+        if HAS_WIN32COM:
+            com_values = _read_cell_values_with_excel_com(xlsx_path, sheet_name, no_col, measure_row_min, max_r)
+            for r, v in com_values.items():
+                no = _try_extract_int(v)
+                if no is not None:
+                    measure_no_to_row[no] = r
         
-        # デバッグ情報を記録（最初の10行のみ）
-        if len(debug_info) < 10:
-            debug_info.append(f"行{r}: 値={v!r}, 型={type(v).__name__}, 数式={formula}")
-        
-        if v is None:
-            continue
-        no = _try_extract_int(v)
-        if no is None:
-            continue
-        measure_no_to_row[no] = r
+        if not measure_no_to_row:
+            # COMが使えない、または値が取れなかった場合
+            raise ValueError(
+                "測定Noの読み取りに失敗しました。\n"
+                "build_request_formulasを先に実行してから、この関数を呼び出してください。"
+            )
 
     target_row = tool_start_row - 3
 
+    # 変更リストを収集（row, col, value）
+    cell_changes = []
+
     # 2) 指定行のE列に"測定不要"を書き込み（工具開始行-3）
     e_col = column_index_from_string("E")
-    ws.cell(target_row, e_col).value = "測定不要"
+    cell_changes.append((target_row, e_col, "測定不要"))
 
     # 3) 指定したNo.の行のL～SR列に条件付きで"-"を書き込む
     # 条件: 指定行（target_row）の同じ列に値が入ると、該当行のL～SR列に"-"が入る
     flag_col_start = column_index_from_string("L")
-    flag_col_end = column_index_from_string("SR")
+    flag_col_end = column_index_from_string("L")  # L列のみ書き込み（M~SR列は手動コピー）
 
     written_count = 0
     not_found_nos = []
@@ -361,7 +639,7 @@ def write_measurement_not_required(
             target_cell = f"{col_letter}{target_row}"
             # =IF(L197<>"","-","")
             formula = f'=IF({target_cell}<>"","-","")'
-            ws.cell(row, col_idx).value = formula
+            cell_changes.append((row, col_idx, formula))
         written_count += 1
 
     if written_count == 0 and target_nos:
@@ -370,8 +648,6 @@ def write_measurement_not_required(
         if len(available_nos) > 20:
             available_nos_str += f" ... (他{len(available_nos) - 20}件)"
         
-        debug_str = "\n".join(debug_info)
-        
         raise ValueError(
             f"指定したNo.の行が見つかりませんでした。\n\n"
             f"【指定したNo.】\n{target_nos}\n\n"
@@ -379,12 +655,25 @@ def write_measurement_not_required(
             f"【設定】\n"
             f"- 測定No列: {measure_no_col}列\n"
             f"- 測定行範囲: {measure_row_min}〜{measure_row_max}行目\n"
-            f"- 読み取れた測定No件数: {len(measure_no_to_row)}件\n\n"
-            f"【デバッグ情報（先頭10行）】\n{debug_str}\n\n"
-            f"※測定Noが数式の場合、Excelで一度ファイルを開いて保存してから再実行してください。"
+            f"- 読み取れた測定No件数: {len(measure_no_to_row)}件"
         )
 
-    return _save_workbook_atomic(wb, out_path, parent=parent)
+    # openpyxlのワークブックを閉じる
+    wb.close()
+
+    # Excel COMで保存（元の数式を壊さない）
+    if HAS_WIN32COM and USE_EXCEL_COM_FOR_SAVE:
+        saved = _save_with_excel_com(xlsx_path, out_path, cell_changes, sheet_name, parent=parent)
+        return saved
+    
+    # フォールバック: openpyxlで書き込み
+    wb = load_workbook(xlsx_path, rich_text=True)
+    ws = wb[sheet_name]
+    for row, col, value in cell_changes:
+        ws.cell(row, col).value = value
+
+    saved = _save_workbook_atomic(wb, out_path, parent=parent)
+    return saved
 
 
 class LoadingDialog(tk.Toplevel):
@@ -959,7 +1248,7 @@ class ConfigEditor(tb.Window):
         
         def build_task():
             try:
-                saved_path = build_request_formulas(xlsx, out_path, cfg, parent=self)
+                saved_path, measure_no_to_row = build_request_formulas(xlsx, out_path, cfg, parent=self)
                 result["saved_path"] = saved_path
                 
                 # 測定不要書き込み設定が入力されている場合は実行
@@ -973,6 +1262,7 @@ class ConfigEditor(tb.Window):
                                 out_path,
                                 cfg,
                                 target_nos=target_nos,
+                                measure_no_to_row=measure_no_to_row,
                                 parent=self,
                             )
                             result["saved_path"] = saved_path
