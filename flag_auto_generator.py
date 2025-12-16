@@ -623,6 +623,8 @@ class ConfigEditor(tb.Window):
 
         self.selected_xlsx = tk.StringVar(value="")
         self.preview_title = tk.StringVar(value="プレビュー (未読み込み)")
+        self.available_measure_nos = []  # プレビューから取得した測定No一覧
+        self.selected_measure_nos = set()  # ユーザーが選択した測定No
 
         self._build_ui()
 
@@ -705,9 +707,16 @@ class ConfigEditor(tb.Window):
         ttk.Label(basic, text="出力列: L（固定）").pack(anchor="w", pady=3)
         ttk.Label(
             basic_right,
-            text="L列に'-'を入れるNo.(カンマ区切り):",
+            text="L列に'-'を入れるNo.:",
         ).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
-        ttk.Entry(basic_right, textvariable=self.vars["not_required_nos"], width=40).grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=5)
+        
+        not_required_button_frame = ttk.Frame(basic_right)
+        not_required_button_frame.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=5)
+        not_required_button_frame.columnconfigure(0, weight=1)
+        
+        ttk.Entry(not_required_button_frame, textvariable=self.vars["not_required_nos"], width=40, state="readonly").pack(side="left", fill="x", expand=True)
+        ttk.Button(not_required_button_frame, text="選択...", command=self._show_not_required_dialog).pack(side="left", padx=(5, 0))
+        
         basic_right.columnconfigure(1, weight=1)
 
         tools_frame = ttk.LabelFrame(main, text="工具と測定No対応", padding=10)
@@ -721,6 +730,9 @@ class ConfigEditor(tb.Window):
         scrollbar = ttk.Scrollbar(tools_frame, orient="vertical", command=self.tools_tree.yview)
         self.tools_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
+        
+        # ダブルクリックで編集
+        self.tools_tree.bind("<Double-1>", self._on_tool_tree_double_click)
 
         btns = ttk.Frame(main)
         btns.pack(fill="x", pady=(10, 0))
@@ -876,6 +888,21 @@ class ConfigEditor(tb.Window):
 
         col_widths = {"A": 80, "B": 120, "G": 140, "K": 140}
         
+        # 測定No一覧を抽出
+        measure_no_col = column_index_from_string(self.vars["measure_no_col"].get().strip() or "A")
+        measure_row_min = self.vars["measure_row_min"].get()
+        measure_row_max = self.vars["measure_row_max"].get()
+        measure_row_step = self.vars["measure_row_step"].get()
+        
+        self.available_measure_nos = []
+        for r in range(measure_row_min, measure_row_max + 1, measure_row_step):
+            v = ws.cell(r, measure_no_col).value
+            if v is not None:
+                no = _try_extract_int(v)
+                if no is not None:
+                    self.available_measure_nos.append(no)
+        self.available_measure_nos = sorted(set(self.available_measure_nos))
+        
         # UIの更新はメインスレッドで実行
         def update_ui():
             self.preview_tree.configure(columns=self.preview_columns)
@@ -932,6 +959,130 @@ class ConfigEditor(tb.Window):
         
         self.after(0, update_ui)
 
+    def _update_not_required_nos_var(self):
+        """選択された測定Nosを文字列に変換して変数を更新"""
+        nos_str = ", ".join(map(str, sorted(self.selected_measure_nos)))
+        self.vars["not_required_nos"].set(nos_str)
+
+    def _on_tool_tree_double_click(self, event):
+        """工具Treeviewのダブルクリックイベント"""
+        sel = self.tools_tree.selection()
+        if sel:
+            self._edit_selected_tool()
+
+    def _show_not_required_dialog(self):
+        """測定不要No選択ダイアログを表示"""
+        win = tk.Toplevel(self)
+        win.title("測定不要No選択")
+        win.transient(self)
+        win.grab_set()
+        
+        # ウィンドウを横方向中央に配置
+        window_width = 900
+        window_height = 600
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        center_x = int(screen_width / 2 - window_width / 2)
+        center_y = int(screen_height / 2 - window_height / 2)
+        win.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
+
+        # 初期値から選択状態を復元
+        initial_selected = set(self.selected_measure_nos)
+
+        main_frame = ttk.Frame(win, padding=10)
+        main_frame.pack(fill="both", expand=True)
+        
+        # 左側：プレビューテーブル
+        left_frame = ttk.LabelFrame(main_frame, text="プレビュー", padding=5)
+        left_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        
+        preview_tree = ttk.Treeview(left_frame, columns=("A", "B", "G", "K"), show="headings", height=20)
+        preview_tree.heading("A", text="A")
+        preview_tree.heading("B", text="B")
+        preview_tree.heading("G", text="G")
+        preview_tree.heading("K", text="K")
+        preview_tree.column("A", width=100, anchor="center")
+        preview_tree.column("B", width=150, anchor="w")
+        preview_tree.column("G", width=150, anchor="w")
+        preview_tree.column("K", width=150, anchor="w")
+        
+        # プレビューツリーの内容をコピー
+        for item in self.preview_tree.get_children():
+            values = self.preview_tree.item(item, "values")
+            preview_tree.insert("", "end", values=values)
+        
+        vsb = ttk.Scrollbar(left_frame, orient="vertical", command=preview_tree.yview)
+        preview_tree.configure(yscrollcommand=vsb.set)
+        preview_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        
+        # 右側：測定No選択
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side="right", fill="both", expand=False, padx=(5, 0), ipadx=10)
+        
+        ttk.Label(right_frame, text="L列に'-'を入れるNo.を選択:", wraplength=200).pack(anchor="w", pady=(0, 8))
+        
+        # スクロール可能なフレーム
+        nos_container = ttk.Frame(right_frame)
+        nos_container.pack(side="top", fill="both", expand=True, pady=(0, 8))
+        
+        nos_canvas = tk.Canvas(nos_container, width=220, height=400, bg="white")
+        nos_scrollbar = ttk.Scrollbar(nos_container, orient="vertical", command=nos_canvas.yview)
+        nos_scrollable_frame = ttk.Frame(nos_canvas)
+        
+        def on_frame_configure(event):
+            nos_canvas.configure(scrollregion=nos_canvas.bbox("all"))
+        
+        nos_scrollable_frame.bind("<Configure>", on_frame_configure)
+        
+        nos_canvas.create_window((0, 0), window=nos_scrollable_frame, anchor="nw")
+        nos_canvas.configure(yscrollcommand=nos_scrollbar.set)
+        
+        # マウスホイールスクロール対応
+        def on_mousewheel(event):
+            if event.delta > 0:
+                nos_canvas.yview_scroll(-1, "units")
+            else:
+                nos_canvas.yview_scroll(1, "units")
+        
+        nos_canvas.bind("<MouseWheel>", on_mousewheel)
+        nos_scrollable_frame.bind("<MouseWheel>", on_mousewheel)
+        
+        nos_canvas.pack(side="left", fill="both", expand=True)
+        nos_scrollbar.pack(side="right", fill="y")
+        
+        # チェックボックス変数
+        nos_vars = {}
+        
+        if self.available_measure_nos:
+            for no in self.available_measure_nos:
+                var = tk.BooleanVar(value=no in initial_selected)
+                nos_vars[no] = var
+                
+                chk = ttk.Checkbutton(nos_scrollable_frame, text=f"No. {no}", variable=var)
+                chk.pack(anchor="w", pady=2)
+        else:
+            ttk.Label(nos_scrollable_frame, text="プレビューを更新して測定Noを取得してください").pack(anchor="w")
+
+        result = {"ok": False}
+
+        def on_ok():
+            selected = set(k for k, v in nos_vars.items() if v.get())
+            self.selected_measure_nos = selected
+            self._update_not_required_nos_var()
+            result["ok"] = True
+            win.destroy()
+
+        def on_cancel():
+            win.destroy()
+
+        bfrm = ttk.Frame(right_frame)
+        bfrm.pack(side="bottom", fill="x", pady=(8, 0))
+        ttk.Button(bfrm, text="OK", command=on_ok).pack(side="right")
+        ttk.Button(bfrm, text="キャンセル", command=on_cancel).pack(side="right", padx=5)
+
+        self.wait_window(win)
+
     def _insert_tool(self, tool_name: str, nos_text: str):
         self.tools_tree.insert("", "end", values=(tool_name, nos_text))
 
@@ -940,22 +1091,111 @@ class ConfigEditor(tb.Window):
         win.title(title)
         win.transient(self)
         win.grab_set()
+        
+        # ウィンドウを横方向中央に配置
+        window_width = 900
+        window_height = 600
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        center_x = int(screen_width / 2 - window_width / 2)
+        center_y = int(screen_height / 2 - window_height / 2)
+        win.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
 
         tool_var = tk.StringVar(value=init_tool)
         nos_var = tk.StringVar(value=init_nos)
+        
+        # 初期値から選択状態を復元
+        initial_selected = set(_parse_int_list(init_nos)) if init_nos else set()
 
-        frm = ttk.Frame(win, padding=10)
+        main_frame = ttk.Frame(win, padding=10)
+        main_frame.pack(fill="both", expand=True)
+        
+        # 左側：プレビューテーブル
+        left_frame = ttk.LabelFrame(main_frame, text="プレビュー", padding=5)
+        left_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        
+        preview_tree = ttk.Treeview(left_frame, columns=("A", "B", "G", "K"), show="headings", height=20)
+        preview_tree.heading("A", text="A")
+        preview_tree.heading("B", text="B")
+        preview_tree.heading("G", text="G")
+        preview_tree.heading("K", text="K")
+        preview_tree.column("A", width=100, anchor="center")
+        preview_tree.column("B", width=150, anchor="w")
+        preview_tree.column("G", width=150, anchor="w")
+        preview_tree.column("K", width=150, anchor="w")
+        
+        # プレビューツリーの内容をコピー
+        for item in self.preview_tree.get_children():
+            values = self.preview_tree.item(item, "values")
+            preview_tree.insert("", "end", values=values)
+        
+        vsb = ttk.Scrollbar(left_frame, orient="vertical", command=preview_tree.yview)
+        preview_tree.configure(yscrollcommand=vsb.set)
+        preview_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        
+        # 右側：工具設定
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side="right", fill="both", expand=False, padx=(5, 0), ipadx=10)
+        
+        frm = ttk.Frame(right_frame)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="工具名").grid(row=0, column=0, sticky="w", pady=4)
+        
+        ttk.Label(frm, text="工具名").pack(anchor="w", pady=(0, 2))
         tool_entry = ttk.Entry(frm, textvariable=tool_var, width=30)
-        tool_entry.grid(row=0, column=1, sticky="w", pady=4)
+        tool_entry.pack(anchor="w", pady=(0, 8))
 
-        ttk.Label(frm, text="測定No(カンマ区切り)").grid(
-            row=1, column=0, sticky="w", pady=4
-        )
-        ttk.Entry(frm, textvariable=nos_var, width=40).grid(
-            row=1, column=1, sticky="w", pady=4
-        )
+        # 測定No選択UI
+        ttk.Label(frm, text="測定No(チェックボックスで選択):", wraplength=200).pack(anchor="w", pady=(0, 8))
+        
+        # スクロール可能なフレーム
+        nos_container = ttk.Frame(frm)
+        nos_container.pack(side="top", fill="both", expand=True, pady=(0, 8))
+        
+        nos_canvas = tk.Canvas(nos_container, width=220, height=300, bg="white")
+        nos_scrollbar = ttk.Scrollbar(nos_container, orient="vertical", command=nos_canvas.yview)
+        nos_scrollable_frame = ttk.Frame(nos_canvas)
+        
+        def on_frame_configure(event):
+            nos_canvas.configure(scrollregion=nos_canvas.bbox("all"))
+        
+        nos_scrollable_frame.bind("<Configure>", on_frame_configure)
+        
+        nos_canvas.create_window((0, 0), window=nos_scrollable_frame, anchor="nw")
+        nos_canvas.configure(yscrollcommand=nos_scrollbar.set)
+        
+        # マウスホイールスクロール対応
+        def on_mousewheel(event):
+            if event.delta > 0:
+                nos_canvas.yview_scroll(-1, "units")
+            else:
+                nos_canvas.yview_scroll(1, "units")
+        
+        nos_canvas.bind("<MouseWheel>", on_mousewheel)
+        nos_scrollable_frame.bind("<MouseWheel>", on_mousewheel)
+        
+        nos_canvas.pack(side="left", fill="both", expand=True)
+        nos_scrollbar.pack(side="right", fill="y")
+        
+        # チェックボックス変数
+        tool_nos_vars = {}
+        
+        if self.available_measure_nos:
+            for no in self.available_measure_nos:
+                var = tk.BooleanVar(value=no in initial_selected)
+                tool_nos_vars[no] = var
+                
+                def on_check(no=no, var=var):
+                    selected = set(k for k, v in tool_nos_vars.items() if v.get())
+                    nos_str = ", ".join(map(str, sorted(selected)))
+                    nos_var.set(nos_str)
+                
+                var.trace_add("write", lambda *args, no=no, var=var: on_check(no, var))
+                
+                chk = ttk.Checkbutton(nos_scrollable_frame, text=f"No. {no}", variable=var)
+                chk.pack(anchor="w", pady=2)
+        else:
+            ttk.Label(nos_scrollable_frame, text="プレビューを更新して測定Noを取得してください").pack(anchor="w")
 
         result = {"ok": False}
 
@@ -966,29 +1206,33 @@ class ConfigEditor(tb.Window):
                     "入力不足", "工具名を入力してください。", parent=win
                 )
                 return
+            nos_text = nos_var.get().strip()
+            if not nos_text:
+                messagebox.showwarning(
+                    "入力不足", "測定Noを1つ以上選択してください。", parent=win
+                )
+                return
             try:
-                _parse_int_list(nos_var.get())
+                _parse_int_list(nos_text)
             except Exception:
                 messagebox.showwarning(
                     "入力エラー",
-                    "測定Noは整数のカンマ区切りで入力してください。",
+                    "測定Noの形式が正しくありません。",
                     parent=win,
                 )
                 return
             result["ok"] = True
             result["tool"] = tool
-            result["nos"] = nos_var.get().strip()
+            result["nos"] = nos_text
             win.destroy()
 
         def on_cancel():
             win.destroy()
 
         bfrm = ttk.Frame(frm)
-        bfrm.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        bfrm.pack(side="bottom", fill="x", pady=(8, 0))
         ttk.Button(bfrm, text="OK", command=on_ok).pack(side="right")
-        ttk.Button(bfrm, text="キャンセル", command=on_cancel).pack(
-            side="right", padx=5
-        )
+        ttk.Button(bfrm, text="キャンセル", command=on_cancel).pack(side="right", padx=5)
 
         tool_entry.focus_set()
         self.wait_window(win)
