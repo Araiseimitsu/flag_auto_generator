@@ -6,7 +6,7 @@ from tkinter import filedialog, messagebox
 import threading
 
 import ttkbootstrap as tb
-from tkinter import ttk
+from ttkbootstrap import ttk
 from ttkbootstrap.scrolled import ScrolledFrame
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
@@ -632,7 +632,6 @@ class ConfigEditor(tb.Window):
         header_frame = ttk.Frame(self)
         header_frame.pack(fill="x", padx=10, pady=(10, 0))
         ttk.Button(header_frame, text="ヘルプ", command=self._show_help).pack(side="right")
-
 
         # スクロール可能コンテナ（ttkbootstrap組み込み）で小さい画面でも末尾ボタンまで操作可能にする
         scroll = ScrolledFrame(self, autohide=True)
@@ -1456,17 +1455,7 @@ class ConfigEditor(tb.Window):
         help_window.title("使い方")
         help_window.transient(self)
         help_window.grab_set()
-        help_window.transient(self)
-        help_window.grab_set()
-
-        # ウィンドウを画面中央に配置
-        window_width = 800
-        window_height = 600
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        center_x = int(screen_width / 2 - window_width / 2)
-        center_y = int(screen_height / 2 - window_height / 2)
-        help_window.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
+        help_window.geometry("600x500")
 
         # スクロール可能なフレーム
         canvas = tk.Canvas(help_window, highlightthickness=0, bd=0)
@@ -1511,7 +1500,7 @@ class ConfigEditor(tb.Window):
 
 【測定不要書き込み設定】
 1. 工具開始行-3行目のE列に「測定不要」が自動で書き込まれます
-2. L列（M～SR列へは手動コピーが必要）に「-」を入れる測定Noをカンマ区切りで指定します
+2. L～SR列に「-」を入れる測定Noをカンマ区切りで指定します
 3. この設定は任意です（空欄の場合はスキップされます）
 
 【Excel生成】
@@ -1522,7 +1511,7 @@ class ConfigEditor(tb.Window):
 
 【生成される内容】
 - 指定した工具に対応する測定Noの行に「依頼」という文字が自動入力されます
-- L列に数式が生成されます。M列〜SR列へは手動でオートフィル（コピー）してください。
+- L列からSR列までの各列に対して処理が実行されます
 - 測定不要設定が指定されている場合は、該当する行に「測定不要」や「-」が書き込まれます
         """
 
@@ -1596,8 +1585,6 @@ class ConfigEditor(tb.Window):
         canvas.bind("<Configure>", configure_canvas_width)
 
         help_window.focus_set()
-
-
 
 
 def main():
