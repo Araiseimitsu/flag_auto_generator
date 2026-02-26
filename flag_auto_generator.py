@@ -3,11 +3,18 @@ import re
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
+import time
+import zipfile
 
 import ttkbootstrap as tb
 from ttkbootstrap import ttk
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.worksheet.formula import ArrayFormula
+
+
+AUTO_DATA_START_ROW_DEFAULT = 230
+AUTO_DATA_MAX_ITEMS = 100
 
 
 def pick_file(title: str, filetypes, parent=None):
@@ -80,6 +87,126 @@ def _save_workbook_atomic(wb, out_path: str, parent=None) -> str:
                     pass
 
 
+def _mark_workbook_for_full_recalc(wb):
+    try:
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+    except Exception:
+        pass
+
+
+def _safe_call(func, *args, default=None, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception:
+        return default
+
+
+def _close_workbook_quietly(wb):
+    if wb is None:
+        return
+    _safe_call(wb.close)
+
+
+def _restore_package_parts_from_source(source_xlsx_path: str, target_xlsx_path: str):
+    prefixes = (
+        "xl/drawings/",
+        "xl/externalLinks/",
+    )
+
+    source_path = os.path.abspath(source_xlsx_path)
+    target_path = os.path.abspath(target_xlsx_path)
+    temp_path = f"{target_path}.pkgfix"
+
+    try:
+        with zipfile.ZipFile(source_path, "r") as src_zip, zipfile.ZipFile(
+            target_path, "r"
+        ) as dst_zip:
+            src_names = set(src_zip.namelist())
+            dst_names = set(dst_zip.namelist())
+            restore_names = {
+                name
+                for name in src_names
+                if any(name.startswith(prefix) for prefix in prefixes)
+            }
+            if not restore_names:
+                return False
+
+            with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
+                for name in dst_zip.namelist():
+                    if any(name.startswith(prefix) for prefix in prefixes):
+                        if name in restore_names:
+                            out_zip.writestr(name, src_zip.read(name))
+                        continue
+                    out_zip.writestr(name, dst_zip.read(name))
+
+                for name in sorted(restore_names):
+                    if name in dst_names:
+                        continue
+                    out_zip.writestr(name, src_zip.read(name))
+
+        os.replace(temp_path, target_path)
+        return True
+    except Exception as e:
+        _safe_call(os.remove, temp_path)
+        print(f"[info] パッケージ復元をスキップしました: {e}")
+        return False
+
+
+def _force_excel_recalc_and_save(xlsx_path: str):
+    try:
+        import win32com.client  # type: ignore
+    except Exception as e:
+        print(f"[warn] Excel強制再計算をスキップしました（pywin32未導入）: {e}")
+        return False
+
+    abs_path = os.path.abspath(xlsx_path)
+    last_error = None
+
+    for attempt in range(3):
+        excel_app = None
+        excel_wb = None
+        try:
+            excel_app = win32com.client.DispatchEx("Excel.Application")
+            excel_app.Visible = False
+            excel_app.DisplayAlerts = False
+            _safe_call(setattr, excel_app, "AskToUpdateLinks", False)
+
+            excel_wb = excel_app.Workbooks.Open(abs_path, UpdateLinks=0, ReadOnly=False)
+
+            _safe_call(setattr, excel_wb, "ForceFullCalculation", True)
+
+            worksheets = _safe_call(lambda: list(excel_wb.Worksheets), default=[])
+            for sheet in worksheets:
+                _safe_call(setattr, sheet, "EnableCalculation", True)
+                _safe_call(sheet.UsedRange.Calculate)
+
+            _safe_call(excel_wb.RefreshAll)
+            _safe_call(excel_app.CalculateFull)
+            excel_app.CalculateFullRebuild()
+            save_as_kwargs = {
+                "Filename": abs_path,
+                "FileFormat": 51,
+                "ConflictResolution": 2,
+                "Local": True,
+            }
+            if _safe_call(excel_wb.SaveAs, **save_as_kwargs) is None:
+                excel_wb.Save()
+            return True
+        except Exception as e:
+            last_error = e
+            time.sleep(0.4 * (attempt + 1))
+        finally:
+            if excel_wb is not None:
+                _safe_call(excel_wb.Close, SaveChanges=True)
+            if excel_app is not None:
+                _safe_call(excel_app.Quit)
+
+    print(f"[info] Excel強制再計算をスキップしました（出力ファイルは作成済み）: {last_error}")
+    return False
+
+
 def _try_extract_int(value):
     if value is None:
         return None
@@ -109,6 +236,103 @@ def _try_extract_int(value):
     return None
 
 
+def _resolve_measure_no(value, row: int, measure_row_min: int, measure_row_step: int):
+    if isinstance(value, str) and value.startswith("="):
+        if measure_row_step <= 0:
+            return None
+
+        row_offset = row - measure_row_min
+        if row_offset < 0:
+            return None
+        if row_offset % measure_row_step != 0:
+            return None
+
+        return (row_offset // measure_row_step) + 1
+
+    return _try_extract_int(value)
+
+
+def _normalize_measure_no_key(value):
+    n = _try_extract_int(value)
+    if n is not None:
+        return n
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_measure_to_index_map(raw_map: dict):
+    normalized = {}
+    if not isinstance(raw_map, dict):
+        return normalized
+    for measure_no, data_index in raw_map.items():
+        key = _normalize_measure_no_key(measure_no)
+        if key == "":
+            continue
+        index_value = _try_extract_int(data_index)
+        if index_value is None or index_value < 1 or index_value > AUTO_DATA_MAX_ITEMS:
+            continue
+        normalized[key] = index_value
+    return normalized
+
+
+def _build_auto_data_formula(col_letter: str, data_start_row: int, data_index: int, sep: str):
+    source_row = data_start_row + data_index - 1
+    return (
+        f'IFERROR(IF({col_letter}{source_row}=""{sep}""{sep}{col_letter}{source_row}){sep}"")'
+    )
+
+
+def _is_empty_cell_value(value):
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def _can_overwrite_with_formula(value):
+    if _is_empty_cell_value(value):
+        return True
+    if isinstance(value, str) and value.startswith("="):
+        return True
+    return False
+
+
+def _normalize_single_cell_array_formulas_in_column(
+    ws,
+    col_letter: str,
+    *,
+    row_start: int = 1,
+    row_end: int | None = None,
+):
+    col_idx = column_index_from_string(col_letter)
+    max_row = ws.max_row or row_start
+    end_row = max_row if row_end is None else min(row_end, max_row)
+    rewritten = 0
+
+    start_row = max(row_start, 1)
+    for row in range(start_row, end_row + 1):
+        cell = ws.cell(row, col_idx)
+        value = cell.value
+        if not isinstance(value, ArrayFormula):
+            continue
+
+        formula_ref = str(value.ref or "").replace("$", "")
+        cell_ref = cell.coordinate.replace("$", "")
+        if formula_ref != cell_ref:
+            continue
+
+        formula_text = str(value.text or "").strip()
+        if not formula_text:
+            continue
+
+        cell.value = f"={formula_text.lstrip('=')}"
+        rewritten += 1
+
+    return rewritten
+
+
 def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=None):
     sheet_name = cfg["sheet_name"]
     measure_no_col = cfg.get("measure_no_col", "A")
@@ -125,6 +349,10 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
     tool_name_col = cfg.get("tool_name_col", "E")
     tool_row_step = int(cfg.get("tool_row_step", measure_row_step))
+    auto_data_start_row = int(cfg.get("auto_data_start_row", AUTO_DATA_START_ROW_DEFAULT))
+    measure_no_to_data_index = _normalize_measure_to_index_map(
+        cfg.get("measure_no_to_data_index", {})
+    )
 
     tools = cfg["tools"]
     tool_to_measure_nos = cfg["tool_to_measure_nos"]
@@ -145,6 +373,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     # 1) 測定No(A列の整数) → 行番号
     no_col = column_index_from_string(measure_no_col)
     measure_no_to_row = {}
+    measure_row_to_no = {}
     max_r = min(measure_row_max, ws.max_row or measure_row_max)
     for r in range(measure_row_min, max_r + 1):
         v = ws_values.cell(r, no_col).value
@@ -152,19 +381,25 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             v = ws.cell(r, no_col).value
         if v is None:
             continue
-        no = _try_extract_int(v)
+        no = _resolve_measure_no(v, r, measure_row_min, measure_row_step)
         if no is None:
             continue
         measure_no_to_row[no] = r
+        measure_row_to_no[r] = no
 
     # 2) 工具名を書き込み & 工具名 → 行番号
     tool_row = {}
     tool_name_c = column_index_from_string(tool_name_col)
     r = tool_start_row
     for tool in tools:
-        ws.cell(r, tool_name_c).value = tool
+        tool_cell = ws.cell(r, tool_name_c)
+        tool_cell.value = tool
         tool_row[tool] = r
         r += tool_row_step
+
+    # 2.5) 自動測定データ開始行のE列に案内を記入
+    auto_data_label_cell = ws.cell(auto_data_start_row, tool_name_c)
+    auto_data_label_cell.value = '測定結果貼付は230行から'
 
     # 3) 測定行ごとに参照すべき工具行（逆引き）
     measure_row_to_tool_rows = {}
@@ -185,6 +420,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
     # 4) 1～3行目に新しい数式を投入、測定行に依頼セルを設定
     written = 0
+    target_found = 0
     for col_idx in range(flag_col_start, flag_col_end + 1):
         col_letter = get_column_letter(col_idx)
         
@@ -195,7 +431,9 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
             f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
         )
-        ws.cell(1, col_idx).value = formula_row1
+        row1_cell = ws.cell(1, col_idx)
+        if _is_empty_cell_value(row1_cell.value):
+            row1_cell.value = formula_row1
 
         # 2行目: SEQUENCE(sequence_count,1,12,3) - measure_row_min+1から開始
         formula_row2 = (
@@ -204,7 +442,9 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
             f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 1}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
         )
-        ws.cell(2, col_idx).value = formula_row2
+        row2_cell = ws.cell(2, col_idx)
+        if _is_empty_cell_value(row2_cell.value):
+            row2_cell.value = formula_row2
 
         # 3行目: SEQUENCE(sequence_count,1,13,3) - measure_row_min+2から開始
         formula_row3 = (
@@ -213,7 +453,9 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
             f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 2}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
         )
-        ws.cell(3, col_idx).value = formula_row3
+        row3_cell = ws.cell(3, col_idx)
+        if _is_empty_cell_value(row3_cell.value):
+            row3_cell.value = formula_row3
 
         # デバッグ用ログ出力
         print(f"列 {col_letter} 1行目: {formula_row1}")
@@ -222,13 +464,46 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
         # 測定行に依頼セルを設定
         for mr, tool_rows in measure_row_to_tool_rows.items():
-            conds = ",".join([f'{col_letter}${tr}<>""' for tr in tool_rows])
-            ws.cell(mr, col_idx).value = f'=IF(OR({conds}),"依頼","")'
+            conds = formula_arg_sep.join([f'{col_letter}${tr}<>""' for tr in tool_rows])
+            measure_no = measure_row_to_no.get(mr)
+            data_index = measure_no_to_data_index.get(measure_no)
+            target_found += 1
+            target_cell = ws.cell(mr, col_idx)
+            if not _is_empty_cell_value(target_cell.value):
+                continue
+            if data_index is not None:
+                auto_formula = _build_auto_data_formula(
+                    col_letter=col_letter,
+                    data_start_row=auto_data_start_row,
+                    data_index=data_index,
+                    sep=formula_arg_sep,
+                )
+                target_cell.value = f'=IF(OR({conds}),"依頼",{auto_formula})'
+            else:
+                target_cell.value = f'=IF(OR({conds}),"依頼","")'
             written += 1
 
-    if written == 0:
+        # 工具に紐づかない行には自動測定データ反映式のみを設定
+        for measure_no, data_index in measure_no_to_data_index.items():
+            mr = measure_no_to_row.get(measure_no)
+            if mr is None or mr in measure_row_to_tool_rows:
+                continue
+            target_found += 1
+            target_cell = ws.cell(mr, col_idx)
+            if not _is_empty_cell_value(target_cell.value):
+                continue
+            auto_formula = _build_auto_data_formula(
+                col_letter=col_letter,
+                data_start_row=auto_data_start_row,
+                data_index=data_index,
+                sep=formula_arg_sep,
+            )
+            target_cell.value = f"={auto_formula}"
+            written += 1
+
+    if target_found == 0:
         raise ValueError(
-            "依頼セルが1件も書き込まれませんでした。\n\n"
+            "依頼/自動測定データの書き込み対象が1件も見つかりませんでした。\n\n"
             f"- 読み取れた測定No件数: {len(measure_no_to_row)}\n"
             f"- 工具件数: {len(tools)}\n"
             f"- 逆引き対象の測定行件数: {len(measure_row_to_tool_rows)}\n"
@@ -240,15 +515,22 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             "3) tool_to_measure_nos のNoがシートに存在しない"
         )
 
-    try:
-        wb.calculation.calcMode = "auto"
-        wb.calculation.fullCalcOnLoad = True
-        wb.calculation.calcOnSave = True
-        wb.calculation.forceFullCalc = True
-    except Exception:
-        pass
+    normalized_count = _normalize_single_cell_array_formulas_in_column(
+        ws,
+        "B",
+        row_start=measure_row_min,
+        row_end=measure_row_max,
+    )
+    if normalized_count:
+        print(f"[info] B列の単一セル配列数式を通常数式へ変換: {normalized_count}件")
 
-    return _save_workbook_atomic(wb, out_path, parent=parent)
+    _mark_workbook_for_full_recalc(wb)
+    saved_path = _save_workbook_atomic(wb, out_path, parent=parent)
+    _close_workbook_quietly(wb_values)
+    _close_workbook_quietly(wb)
+    _restore_package_parts_from_source(xlsx_path, saved_path)
+    _force_excel_recalc_and_save(saved_path)
+    return saved_path
 
 
 def _parse_int_list(text: str):
@@ -294,6 +576,7 @@ def write_measurement_not_required(
     measure_no_col = cfg.get("measure_no_col", "A")
     tool_start_row = int(cfg.get("tool_start_row", 200))
     measure_row_min = int(cfg.get("measure_row_min", 11))
+    measure_row_step = int(cfg.get("measure_row_step", 3))
     measure_row_max = int(cfg.get("measure_row_max", tool_start_row - 4))
 
     wb = load_workbook(xlsx_path)
@@ -324,13 +607,17 @@ def write_measurement_not_required(
             if isinstance(v, str) and v.startswith('='):
                 formula = v
         
-        # デバッグ情報を記録（最初の10行のみ）
-        if len(debug_info) < 10:
-            debug_info.append(f"行{r}: 値={v!r}, 型={type(v).__name__}, 数式={formula}")
-        
         if v is None:
             continue
-        no = _try_extract_int(v)
+
+        no = _resolve_measure_no(v, r, measure_row_min, measure_row_step)
+
+        # デバッグ情報を記録（最初の10行のみ）
+        if len(debug_info) < 10:
+            debug_info.append(
+                f"行{r}: 値={v!r}, 型={type(v).__name__}, 数式={formula}, 解決No={no}"
+            )
+
         if no is None:
             continue
         measure_no_to_row[no] = r
@@ -339,7 +626,8 @@ def write_measurement_not_required(
 
     # 2) 指定行のE列に"測定不要"を書き込み（工具開始行-3）
     e_col = column_index_from_string("E")
-    ws.cell(target_row, e_col).value = "測定不要"
+    target_e_cell = ws.cell(target_row, e_col)
+    target_e_cell.value = "測定不要"
 
     # 3) 指定したNo.の行のL～SR列に条件付きで"-"を書き込む
     # 条件: 指定行（target_row）の同じ列に値が入ると、該当行のL～SR列に"-"が入る
@@ -358,9 +646,11 @@ def write_measurement_not_required(
         for col_idx in range(flag_col_start, flag_col_end + 1):
             col_letter = get_column_letter(col_idx)
             target_cell = f"{col_letter}{target_row}"
-            # =IF(L197<>"","-","")
-            formula = f'=IF({target_cell}<>"","-","")'
-            ws.cell(row, col_idx).value = formula
+            formula = f'=IF(IFERROR(LEN(TRIM({target_cell}&"")),0)>0,"-","")'
+            current_cell = ws.cell(row, col_idx)
+            if not _can_overwrite_with_formula(current_cell.value):
+                continue
+            current_cell.value = formula
         written_count += 1
 
     if written_count == 0 and target_nos:
@@ -383,7 +673,22 @@ def write_measurement_not_required(
             f"※測定Noが数式の場合、Excelで一度ファイルを開いて保存してから再実行してください。"
         )
 
-    return _save_workbook_atomic(wb, out_path, parent=parent)
+    normalized_count = _normalize_single_cell_array_formulas_in_column(
+        ws,
+        "B",
+        row_start=measure_row_min,
+        row_end=measure_row_max,
+    )
+    if normalized_count:
+        print(f"[info] B列の単一セル配列数式を通常数式へ変換: {normalized_count}件")
+
+    _mark_workbook_for_full_recalc(wb)
+    saved_path = _save_workbook_atomic(wb, out_path, parent=parent)
+    _close_workbook_quietly(wb_values)
+    _close_workbook_quietly(wb)
+    _restore_package_parts_from_source(xlsx_path, saved_path)
+    _force_excel_recalc_and_save(saved_path)
+    return saved_path
 
 
 class LoadingDialog(tk.Toplevel):
@@ -462,11 +767,15 @@ class ConfigEditor(tb.Window):
             "tool_start_row": tk.IntVar(value=tool_start_default),
             "tool_name_col": tk.StringVar(value="E"),
             "tool_row_step": tk.IntVar(value=tool_row_step_default),
+            "auto_data_start_row": tk.IntVar(value=AUTO_DATA_START_ROW_DEFAULT),
             "not_required_row": tk.StringVar(
                 value=str(max(tool_start_default - 3, 1))
             ),
             "not_required_nos": tk.StringVar(value=""),
         }
+
+        self.auto_map_measure_no_var = tk.StringVar(value="")
+        self.auto_map_data_index_var = tk.StringVar(value="")
 
         self._bind_basic_setting_sync()
 
@@ -480,8 +789,38 @@ class ConfigEditor(tb.Window):
         header_frame.pack(fill="x", padx=10, pady=(10, 0))
         ttk.Button(header_frame, text="ヘルプ", command=self._show_help).pack(side="right")
 
-        main = ttk.Frame(self, padding=10)
-        main.pack(fill="both", expand=True)
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self.main_canvas = tk.Canvas(body, highlightthickness=0, bd=0)
+        self.main_scrollbar = ttk.Scrollbar(
+            body,
+            orient="vertical",
+            command=self.main_canvas.yview,
+        )
+        self.main_canvas.configure(yscrollcommand=self.main_scrollbar.set)
+
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        self.main_scrollbar.pack(side="right", fill="y")
+
+        main = ttk.Frame(self.main_canvas, padding=10)
+        self.main_canvas_window = self.main_canvas.create_window(
+            (0, 0),
+            window=main,
+            anchor="nw",
+        )
+
+        def _update_main_scroll_region(event=None):
+            self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+
+        def _fit_main_width(event):
+            self.main_canvas.itemconfigure(self.main_canvas_window, width=event.width)
+
+        main.bind("<Configure>", _update_main_scroll_region)
+        self.main_canvas.bind("<Configure>", _fit_main_width)
+        self.bind_all("<MouseWheel>", self._on_main_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_main_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_main_mousewheel, add="+")
 
         # 元Excel読み込み＆プレビュー
         source_frame = ttk.LabelFrame(main, text="元Excelとプレビュー", padding=10)
@@ -558,6 +897,7 @@ class ConfigEditor(tb.Window):
         add_field(1, 1, "工具開始行", "tool_start_row")
         add_field(2, 1, "工具名列", "tool_name_col")
         add_field(3, 1, "工具行ステップ", "tool_row_step")
+        add_field(4, 1, "自動測定データ開始行", "auto_data_start_row")
 
         ttk.Label(basic, text="出力列: L～SR（固定）").pack(anchor="w", pady=3)
         ttk.Label(basic_right, text="E列 (工具開始行-3) の行番号:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
@@ -586,15 +926,79 @@ class ConfigEditor(tb.Window):
         self.tools_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
 
+        tools_btns = ttk.Frame(main)
+        tools_btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(tools_btns, text="工具追加", command=self._add_tool_dialog).pack(side="left")
+        ttk.Button(tools_btns, text="選択編集", command=self._edit_selected_tool).pack(side="left", padx=5)
+        ttk.Button(tools_btns, text="選択削除", command=self._delete_selected_tool).pack(side="left")
+
+        auto_map_frame = ttk.LabelFrame(main, text="自動測定データ対応（測定No → データ順番）", padding=10)
+        auto_map_frame.pack(fill="both", expand=True, pady=(10, 0))
+
+        auto_input = ttk.Frame(auto_map_frame)
+        auto_input.pack(fill="x", pady=(0, 8))
+        ttk.Label(auto_input, text="測定No").pack(side="left")
+        ttk.Entry(auto_input, textvariable=self.auto_map_measure_no_var, width=12).pack(
+            side="left", padx=(6, 12)
+        )
+        ttk.Label(auto_input, text=f"データ順番 (1〜{AUTO_DATA_MAX_ITEMS})").pack(side="left")
+        ttk.Entry(auto_input, textvariable=self.auto_map_data_index_var, width=12).pack(
+            side="left", padx=(6, 12)
+        )
+        ttk.Button(auto_input, text="追加", command=self._add_auto_map).pack(side="left")
+        ttk.Button(auto_input, text="選択削除", command=self._delete_selected_auto_map).pack(
+            side="left", padx=6
+        )
+
+        self.auto_map_tree = ttk.Treeview(
+            auto_map_frame,
+            columns=("measure_no", "data_index"),
+            show="headings",
+            height=6,
+        )
+        self.auto_map_tree.heading("measure_no", text="測定No")
+        self.auto_map_tree.heading("data_index", text="データ順番")
+        self.auto_map_tree.column("measure_no", width=200, anchor="w")
+        self.auto_map_tree.column("data_index", width=140, anchor="center")
+        self.auto_map_tree.pack(side="left", fill="both", expand=True)
+        auto_scrollbar = ttk.Scrollbar(
+            auto_map_frame,
+            orient="vertical",
+            command=self.auto_map_tree.yview,
+        )
+        self.auto_map_tree.configure(yscrollcommand=auto_scrollbar.set)
+        auto_scrollbar.pack(side="right", fill="y")
+
         btns = ttk.Frame(main)
         btns.pack(fill="x", pady=(10, 0))
-        ttk.Button(btns, text="工具追加", command=self._add_tool_dialog).pack(side="left")
-        ttk.Button(btns, text="選択編集", command=self._edit_selected_tool).pack(side="left", padx=5)
-        ttk.Button(btns, text="選択削除", command=self._delete_selected_tool).pack(side="left")
         ttk.Button(btns, text="この設定でExcel生成", command=self._run_build).pack(side="right")
 
         if not self.tools_tree.get_children():
             self._insert_tool("前挽き(サンプル)", "1, 5, 10")
+
+    def _is_in_main_content(self, widget):
+        current = widget
+        while current is not None:
+            if current is self.main_canvas:
+                return True
+            parent_name = current.winfo_parent()
+            if not parent_name:
+                break
+            try:
+                current = current.nametowidget(parent_name)
+            except Exception:
+                break
+        return False
+
+    def _on_main_mousewheel(self, event):
+        if not self._is_in_main_content(event.widget):
+            return
+        if getattr(event, "delta", 0):
+            self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        elif getattr(event, "num", None) == 4:
+            self.main_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.main_canvas.yview_scroll(1, "units")
 
     def _bind_basic_setting_sync(self):
         self.vars["tool_start_row"].trace_add("write", self._sync_tool_start_row)
@@ -887,14 +1291,64 @@ class ConfigEditor(tb.Window):
         for item in sel:
             self.tools_tree.delete(item)
 
+    def _add_auto_map(self):
+        measure_no_raw = self.auto_map_measure_no_var.get().strip()
+        data_index_raw = self.auto_map_data_index_var.get().strip()
+
+        key = _normalize_measure_no_key(measure_no_raw)
+        data_index = _try_extract_int(data_index_raw)
+
+        if key == "":
+            messagebox.showwarning("入力エラー", "測定Noを入力してください。", parent=self)
+            return
+        if data_index is None or data_index < 1 or data_index > AUTO_DATA_MAX_ITEMS:
+            messagebox.showwarning(
+                "入力エラー",
+                f"データ順番は1〜{AUTO_DATA_MAX_ITEMS}の整数で入力してください。",
+                parent=self,
+            )
+            return
+
+        key_str = str(key)
+        existing = None
+        for item in self.auto_map_tree.get_children():
+            values = self.auto_map_tree.item(item, "values")
+            if str(values[0]) == key_str:
+                existing = item
+                break
+
+        if existing is not None:
+            self.auto_map_tree.item(existing, values=(key_str, str(data_index)))
+        else:
+            self.auto_map_tree.insert("", "end", values=(key_str, str(data_index)))
+
+        self.auto_map_measure_no_var.set("")
+        self.auto_map_data_index_var.set("")
+
+    def _delete_selected_auto_map(self):
+        sel = self.auto_map_tree.selection()
+        if not sel:
+            return
+        for item in sel:
+            self.auto_map_tree.delete(item)
+
     def _gather_cfg(self):
         try:
             tools = []
             tool_to_measure_nos = {}
+            measure_no_to_data_index = {}
             for item in self.tools_tree.get_children():
                 tool, nos_text = self.tools_tree.item(item, "values")
                 tools.append(tool)
                 tool_to_measure_nos[tool] = _parse_int_list(nos_text)
+
+            for item in self.auto_map_tree.get_children():
+                measure_no_text, data_index_text = self.auto_map_tree.item(item, "values")
+                key = _normalize_measure_no_key(measure_no_text)
+                data_index = _try_extract_int(data_index_text)
+                if key == "" or data_index is None:
+                    continue
+                measure_no_to_data_index[key] = data_index
 
             if not tools:
                 raise ValueError("工具が1件もありません。")
@@ -912,6 +1366,8 @@ class ConfigEditor(tb.Window):
                 "tool_start_row": int(self.vars["tool_start_row"].get()),
                 "tool_name_col": self.vars["tool_name_col"].get().strip().upper(),
                 "tool_row_step": int(self.vars["tool_row_step"].get()),
+                "auto_data_start_row": int(self.vars["auto_data_start_row"].get()),
+                "measure_no_to_data_index": measure_no_to_data_index,
                 "tools": tools,
                 "tool_to_measure_nos": tool_to_measure_nos,
             }
@@ -1088,7 +1544,7 @@ class ConfigEditor(tb.Window):
         version_frame = ttk.LabelFrame(content_frame, text="バージョン情報", padding=10)
         version_frame.pack(fill="x", pady=(0, 15))
 
-        ttk.Label(version_frame, text="Version: 0.5.0", font=("", 10, "bold")).pack(
+        ttk.Label(version_frame, text="Version: 0.6.0", font=("", 10, "bold")).pack(
             anchor="w"
         )
         ttk.Label(version_frame, text="Latest: 2025-12-15", font=("", 10)).pack(
@@ -1117,6 +1573,11 @@ class ConfigEditor(tb.Window):
 1. 工具開始行-3行目のE列に「測定不要」が自動で書き込まれます
 2. L～SR列に「-」を入れる測定Noをカンマ区切りで指定します
 3. この設定は任意です（空欄の場合はスキップされます）
+
+【自動測定データ対応】
+1. 「自動測定データ開始行」は既定で230行です
+2. 「測定No → データ順番」を追加すると、L～SR列で同一列の下部データを参照します
+3. 工具影響があるセルは「依頼」を優先し、それ以外は測定データ参照式を設定します
 
 【Excel生成】
 1. 「この設定でExcel生成」ボタンをクリックします
