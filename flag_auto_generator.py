@@ -1,22 +1,13 @@
 ﻿import os
 import re
-import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
 
 import ttkbootstrap as tb
 from ttkbootstrap import ttk
-from ttkbootstrap.scrolled import ScrolledFrame
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
-
-# Excel COM オートメーション（Windows環境でファイル破損を防ぐため）
-try:
-    import win32com.client
-    HAS_WIN32COM = True
-except ImportError:
-    HAS_WIN32COM = False
 
 
 def pick_file(title: str, filetypes, parent=None):
@@ -29,178 +20,64 @@ def pick_file(title: str, filetypes, parent=None):
     return filedialog.askopenfilename(parent=parent, title=title, filetypes=filetypes)
 
 
-def pick_save_path(title: str, defaultextension: str, filetypes, parent=None, initialfile=None, initialdir=None):
+def pick_save_path(title: str, defaultextension: str, filetypes, parent=None):
     if parent is None:
         root = tk.Tk()
         root.withdraw()
-        kwargs = {
-            "title": title,
-            "defaultextension": defaultextension,
-            "filetypes": filetypes,
-        }
-        if initialfile:
-            kwargs["initialfile"] = initialfile
-        if initialdir:
-            kwargs["initialdir"] = initialdir
-        path = filedialog.asksaveasfilename(**kwargs)
+        path = filedialog.asksaveasfilename(
+            title=title,
+            defaultextension=defaultextension,
+            filetypes=filetypes,
+        )
         root.destroy()
         return path
-    kwargs = {
-        "parent": parent,
-        "title": title,
-        "defaultextension": defaultextension,
-        "filetypes": filetypes,
-    }
-    if initialfile:
-        kwargs["initialfile"] = initialfile
-    if initialdir:
-        kwargs["initialdir"] = initialdir
-    return filedialog.asksaveasfilename(**kwargs)
+    return filedialog.asksaveasfilename(
+        parent=parent,
+        title=title,
+        defaultextension=defaultextension,
+        filetypes=filetypes,
+    )
 
 
-def _save_with_excel_com(xlsx_path: str, out_path: str, cell_changes: list, sheet_name: str, parent=None) -> str:
-    """
-    Excel COMオートメーションでセルに値を書き込む（高速版）
-    元の数式を壊さず、図形・外部リンクも保持
-    
-    Args:
-        xlsx_path: 元のExcelファイルパス
-        out_path: 出力ファイルパス
-        cell_changes: [(row, col, value), ...] の変更リスト
-        sheet_name: シート名
-        parent: 親ウィンドウ
-    
-    Returns:
-        保存されたファイルのパス
-    """
-    xlsx_path = os.path.abspath(xlsx_path)
+def _save_workbook_atomic(wb, out_path: str, parent=None) -> str:
     out_path = os.path.abspath(out_path)
-    
-    # 元ファイルと出力先が異なる場合はコピー
-    if xlsx_path != out_path:
-        shutil.copy2(xlsx_path, out_path)
-    
-    excel = None
-    wb = None
-    try:
-        excel = win32com.client.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        excel.ScreenUpdating = False
-        
-        wb = excel.Workbooks.Open(out_path)
-        ws = wb.Sheets(sheet_name)
-        # 列ごとにグループ化
-        col_changes = {}
-        for row, col, value in cell_changes:
-            if col not in col_changes:
-                col_changes[col] = {}
-            col_changes[col][row] = value
-        
-        # 列ごとにRange一括書き込み
-        for col, row_values in col_changes.items():
-            col_letter = get_column_letter(col)
-            rows = sorted(row_values.keys())
-            if not rows:
-                continue
-            
-            min_row = rows[0]
-            max_row = rows[-1]
-            
-            # 連続した範囲として書き込み（最高速）
-            if len(rows) == max_row - min_row + 1:
-                # 全て連続している場合
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    base, ext = os.path.splitext(out_path)
+    ext = ext or ".xlsx"
+    tmp_path = f"{base}.tmp{ext}"
+
+    while True:
+        try:
+            wb.save(tmp_path)
+            os.replace(tmp_path, out_path)
+            return out_path
+        except PermissionError as e:
+            if os.path.exists(tmp_path):
                 try:
-                    rng = ws.Range(ws.Cells(min_row, col), ws.Cells(max_row, col))
-                    values = [[row_values[r]] for r in rows]
-                    rng.Value = values
+                    os.remove(tmp_path)
                 except Exception:
-                    # 一括書き込み失敗時は個別に書き込み
-                    for row in rows:
-                        ws.Cells(row, col).Value = row_values[row]
-            else:
-                # 歯抜けがある場合は個別に書き込み
-                for row in rows:
-                    ws.Cells(row, col).Value = row_values[row]
-        
-        excel.ScreenUpdating = True
-        wb.Save()
-        return out_path
-    except Exception as e:
-        if parent:
-            messagebox.showerror(
-                "Excel COM エラー",
-                f"Excelでファイルを操作中にエラーが発生しました。\n\n{e}",
+                    pass
+            if parent is None:
+                raise
+            retry = messagebox.askretrycancel(
+                "保存に失敗",
+                "出力先ファイルに書き込めません。\n"
+                "Excelで出力先ファイルを開いている場合は閉じてから「再試行」を押してください。\n\n"
+                f"出力先:\n{out_path}\n\n"
+                f"詳細:\n{e}",
                 parent=parent,
             )
-        raise
-    finally:
-        if wb:
-            try:
-                wb.Close(False)
-            except Exception:
-                pass
-        if excel:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
-
-
-def _read_cell_values_with_excel_com(xlsx_path: str, sheet_name: str, col: int, row_min: int, row_max: int) -> dict:
-    """
-    Excel COMで数式の計算結果を読み取る（高速）
-    
-    Args:
-        xlsx_path: Excelファイルパス
-        sheet_name: シート名
-        col: 列番号（1-indexed）
-        row_min: 開始行（1-indexed）
-        row_max: 終了行（1-indexed）
-    
-    Returns:
-        {行番号: 値} の辞書
-    """
-    xlsx_path = os.path.abspath(xlsx_path)
-    excel = None
-    wb = None
-    result = {}
-    try:
-        excel = win32com.client.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        
-        wb = excel.Workbooks.Open(xlsx_path, ReadOnly=True)
-        ws = wb.Sheets(sheet_name)
-        
-        # 範囲を一括で取得（高速）
-        rng = ws.Range(ws.Cells(row_min, col), ws.Cells(row_max, col))
-        values = rng.Value
-        
-        # 単一セルの場合は配列でなく値が返る
-        if row_min == row_max:
-            result[row_min] = values
-        elif values:
-            for i, val in enumerate(values):
-                if isinstance(val, tuple):
-                    result[row_min + i] = val[0]
-                else:
-                    result[row_min + i] = val
-        
-        return result
-    except Exception:
-        return {}
-    finally:
-        if wb:
-            try:
-                wb.Close(False)
-            except Exception:
-                pass
-        if excel:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
+            if not retry:
+                raise
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
 
 def _try_extract_int(value):
@@ -244,7 +121,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     summary_row_step = int(cfg.get("summary_row_step", measure_row_step))
     formula_arg_sep = str(cfg.get("formula_arg_sep", ",")).strip() or ","
     flag_col_start = column_index_from_string("L")
-    flag_col_end = column_index_from_string("L")  # L列のみ書き込み（M~SR列は手動コピー）
+    flag_col_end = column_index_from_string("SR")
 
     tool_name_col = cfg.get("tool_name_col", "E")
     tool_row_step = int(cfg.get("tool_row_step", measure_row_step))
@@ -252,26 +129,10 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     tools = cfg["tools"]
     tool_to_measure_nos = cfg["tool_to_measure_nos"]
 
-    def _detect_sep(ws):
-        sep_counts = {",": 0, ";": 0}
-        # 既存の数式から区切り文字を推定（最初に見つかったものを優先）
-        for row in ws.iter_rows(min_row=1, max_row=min(200, ws.max_row or 200)):
-            for cell in row:
-                v = cell.value
-                if isinstance(v, str) and v.startswith("="):
-                    sep_counts[","] += v.count(",")
-                    sep_counts[";"] += v.count(";")
-            if sep_counts[","] or sep_counts[";"]:
-                break
-        if sep_counts[","] == 0 and sep_counts[";"] == 0:
-            return None
-        return "," if sep_counts[","] >= sep_counts[";"] else ";"
-
     # SEQUENCE関数の第1引数として使用する値を計算（工具開始行-4）
     sequence_count = tool_start_row - 4
 
-    # openpyxlで読み込み（分析用）
-    wb = load_workbook(xlsx_path, rich_text=True)
+    wb = load_workbook(xlsx_path)
     wb_values = load_workbook(xlsx_path, data_only=True)
     if sheet_name not in wb.sheetnames:
         raise ValueError(
@@ -280,37 +141,15 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
     ws = wb[sheet_name]
     ws_values = wb_values[sheet_name]
-    auto_sep = _detect_sep(ws)
-    if auto_sep:
-        formula_arg_sep = auto_sep
 
     # 1) 測定No(A列の整数) → 行番号
     no_col = column_index_from_string(measure_no_col)
     measure_no_to_row = {}
     max_r = min(measure_row_max, ws.max_row or measure_row_max)
-    
-    # openpyxlで値を取得できない場合（数式でキャッシュがない場合）はExcel COMで読み取り
-    com_values = {}
-    needs_com = False
     for r in range(measure_row_min, max_r + 1):
         v = ws_values.cell(r, no_col).value
         if v is None:
-            raw = ws.cell(r, no_col).value
-            if isinstance(raw, str) and raw.startswith('='):
-                needs_com = True
-                break
-    
-    if needs_com and HAS_WIN32COM:
-        com_values = _read_cell_values_with_excel_com(xlsx_path, sheet_name, no_col, measure_row_min, max_r)
-    
-    for r in range(measure_row_min, max_r + 1):
-        v = ws_values.cell(r, no_col).value
-        if v is None:
-            # Excel COMの値を優先
-            if r in com_values:
-                v = com_values[r]
-            else:
-                v = ws.cell(r, no_col).value
+            v = ws.cell(r, no_col).value
         if v is None:
             continue
         no = _try_extract_int(v)
@@ -318,15 +157,12 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             continue
         measure_no_to_row[no] = r
 
-    # 変更リストを収集（row, col, value）
-    cell_changes = []
-
     # 2) 工具名を書き込み & 工具名 → 行番号
     tool_row = {}
     tool_name_c = column_index_from_string(tool_name_col)
     r = tool_start_row
     for tool in tools:
-        cell_changes.append((r, tool_name_c, tool))
+        ws.cell(r, tool_name_c).value = tool
         tool_row[tool] = r
         r += tool_row_step
 
@@ -351,25 +187,43 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     written = 0
     for col_idx in range(flag_col_start, flag_col_end + 1):
         col_letter = get_column_letter(col_idx)
-        # FILTER/SEQUENCE 非対応環境でも壊れないよう従来関数のみでカウント
-        def _count_formula(start_row: int) -> str:
-            rng = f"{col_letter}{start_row}:{col_letter}{measure_row_max}"
-            # =SUMPRODUCT(--(L11:L196<>""),--(MOD(ROW(L11:L196)-11,3)=0))
-            return (
-                f"=SUMPRODUCT(--({rng}<>\"\" ){formula_arg_sep}"
-                f"--(MOD(ROW({rng})-{start_row}{formula_arg_sep}{measure_row_step})=0))"
-            )
+        
+        # 1行目: SEQUENCE(sequence_count,1,11,3) - measure_row_minから開始
+        formula_row1 = (
+            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
+            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
+        )
+        ws.cell(1, col_idx).value = formula_row1
 
-        cell_changes.append((1, col_idx, _count_formula(measure_row_min)))
-        cell_changes.append((2, col_idx, _count_formula(measure_row_min + 1)))
-        cell_changes.append((3, col_idx, _count_formula(measure_row_min + 2)))
+        # 2行目: SEQUENCE(sequence_count,1,12,3) - measure_row_min+1から開始
+        formula_row2 = (
+            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 1}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
+            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 1}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
+        )
+        ws.cell(2, col_idx).value = formula_row2
+
+        # 3行目: SEQUENCE(sequence_count,1,13,3) - measure_row_min+2から開始
+        formula_row3 = (
+            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 2}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
+            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
+            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 2}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
+        )
+        ws.cell(3, col_idx).value = formula_row3
+
+        # デバッグ用ログ出力
+        print(f"列 {col_letter} 1行目: {formula_row1}")
+        print(f"列 {col_letter} 2行目: {formula_row2}")
+        print(f"列 {col_letter} 3行目: {formula_row3}")
 
         # 測定行に依頼セルを設定
         for mr, tool_rows in measure_row_to_tool_rows.items():
-            # 工具行のいずれかに値が入っていれば「依頼」
-            conds = f"{formula_arg_sep}".join([f'{col_letter}${tr}<>""' for tr in tool_rows])
-            formula = f'=IF(OR({conds}){formula_arg_sep}"依頼"{formula_arg_sep}"")'
-            cell_changes.append((mr, col_idx, formula))
+            conds = ",".join([f'{col_letter}${tr}<>""' for tr in tool_rows])
+            ws.cell(mr, col_idx).value = f'=IF(OR({conds}),"依頼","")'
             written += 1
 
     if written == 0:
@@ -386,22 +240,15 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             "3) tool_to_measure_nos のNoがシートに存在しない"
         )
 
-    # openpyxlのワークブックを閉じる
-    wb.close()
-    wb_values.close()
+    try:
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.calcOnSave = True
+        wb.calculation.forceFullCalc = True
+    except Exception:
+        pass
 
-    # Excel COMで保存（元の数式を保護）
-    if not HAS_WIN32COM:
-        if parent:
-            messagebox.showerror(
-                "エラー",
-                "pywin32がインストールされていません。\n\npip install pywin32",
-                parent=parent
-            )
-        raise ImportError("pywin32が必要です")
-    
-    saved = _save_with_excel_com(xlsx_path, out_path, cell_changes, sheet_name, parent=parent)
-    return saved, measure_no_to_row
+    return _save_workbook_atomic(wb, out_path, parent=parent)
 
 
 def _parse_int_list(text: str):
@@ -424,7 +271,6 @@ def write_measurement_not_required(
     out_path: str,
     cfg: dict,
     target_nos: list = None,
-    measure_no_to_row: dict = None,
     *,
     parent=None,
 ):
@@ -436,7 +282,6 @@ def write_measurement_not_required(
         out_path: 出力Excelファイルのパス
         cfg: 設定辞書（sheet_name, measure_no_col, measure_row_min, measure_row_max を含む）
         target_nos: L～SR列に"-"を書き込む対象のNo.リスト（A列から検索）
-        measure_no_to_row: 測定No→行番号のマッピング（build_request_formulasから渡される）
         parent: 親ウィンドウ（エラーメッセージ表示用）
 
     Returns:
@@ -451,8 +296,8 @@ def write_measurement_not_required(
     measure_row_min = int(cfg.get("measure_row_min", 11))
     measure_row_max = int(cfg.get("measure_row_max", tool_start_row - 4))
 
-    # openpyxlで読み込み（書き込み用）
-    wb = load_workbook(xlsx_path, rich_text=True)
+    wb = load_workbook(xlsx_path)
+    wb_values = load_workbook(xlsx_path, data_only=True)
 
     if sheet_name not in wb.sheetnames:
         raise ValueError(
@@ -460,42 +305,46 @@ def write_measurement_not_required(
         )
 
     ws = wb[sheet_name]
+    ws_values = wb_values[sheet_name]
 
-    # measure_no_to_rowが渡されていない場合のみ読み取り
-    # （通常はbuild_request_formulasから渡されるので不要）
-    if measure_no_to_row is None:
-        measure_no_to_row = {}
-        no_col = column_index_from_string(measure_no_col)
-        max_r = min(measure_row_max, ws.max_row or measure_row_max)
+    # 1) 測定No(A列の整数) → 行番号のマッピングを作成
+    no_col = column_index_from_string(measure_no_col)
+    measure_no_to_row = {}
+    max_r = min(measure_row_max, ws.max_row or measure_row_max)
+    debug_info = []  # デバッグ情報を収集
+    
+    for r in range(measure_row_min, max_r + 1):
+        v = ws_values.cell(r, no_col).value
+        cell_obj = ws.cell(r, no_col)
+        formula = None
         
-        # Excel COMで読み取り（数式の計算結果を取得）
-        if HAS_WIN32COM:
-            com_values = _read_cell_values_with_excel_com(xlsx_path, sheet_name, no_col, measure_row_min, max_r)
-            for r, v in com_values.items():
-                no = _try_extract_int(v)
-                if no is not None:
-                    measure_no_to_row[no] = r
+        if v is None:
+            v = cell_obj.value
+            # 数式の場合、数式文字列が返される
+            if isinstance(v, str) and v.startswith('='):
+                formula = v
         
-        if not measure_no_to_row:
-            # COMが使えない、または値が取れなかった場合
-            raise ValueError(
-                "測定Noの読み取りに失敗しました。\n"
-                "build_request_formulasを先に実行してから、この関数を呼び出してください。"
-            )
+        # デバッグ情報を記録（最初の10行のみ）
+        if len(debug_info) < 10:
+            debug_info.append(f"行{r}: 値={v!r}, 型={type(v).__name__}, 数式={formula}")
+        
+        if v is None:
+            continue
+        no = _try_extract_int(v)
+        if no is None:
+            continue
+        measure_no_to_row[no] = r
 
     target_row = tool_start_row - 3
 
-    # 変更リストを収集（row, col, value）
-    cell_changes = []
-
     # 2) 指定行のE列に"測定不要"を書き込み（工具開始行-3）
     e_col = column_index_from_string("E")
-    cell_changes.append((target_row, e_col, "測定不要"))
+    ws.cell(target_row, e_col).value = "測定不要"
 
     # 3) 指定したNo.の行のL～SR列に条件付きで"-"を書き込む
     # 条件: 指定行（target_row）の同じ列に値が入ると、該当行のL～SR列に"-"が入る
     flag_col_start = column_index_from_string("L")
-    flag_col_end = column_index_from_string("L")  # L列のみ書き込み（M~SR列は手動コピー）
+    flag_col_end = column_index_from_string("SR")
 
     written_count = 0
     not_found_nos = []
@@ -511,7 +360,7 @@ def write_measurement_not_required(
             target_cell = f"{col_letter}{target_row}"
             # =IF(L197<>"","-","")
             formula = f'=IF({target_cell}<>"","-","")'
-            cell_changes.append((row, col_idx, formula))
+            ws.cell(row, col_idx).value = formula
         written_count += 1
 
     if written_count == 0 and target_nos:
@@ -520,6 +369,8 @@ def write_measurement_not_required(
         if len(available_nos) > 20:
             available_nos_str += f" ... (他{len(available_nos) - 20}件)"
         
+        debug_str = "\n".join(debug_info)
+        
         raise ValueError(
             f"指定したNo.の行が見つかりませんでした。\n\n"
             f"【指定したNo.】\n{target_nos}\n\n"
@@ -527,24 +378,12 @@ def write_measurement_not_required(
             f"【設定】\n"
             f"- 測定No列: {measure_no_col}列\n"
             f"- 測定行範囲: {measure_row_min}〜{measure_row_max}行目\n"
-            f"- 読み取れた測定No件数: {len(measure_no_to_row)}件"
+            f"- 読み取れた測定No件数: {len(measure_no_to_row)}件\n\n"
+            f"【デバッグ情報（先頭10行）】\n{debug_str}\n\n"
+            f"※測定Noが数式の場合、Excelで一度ファイルを開いて保存してから再実行してください。"
         )
 
-    # openpyxlのワークブックを閉じる
-    wb.close()
-
-    # Excel COMで保存（元の数式を保護）
-    if not HAS_WIN32COM:
-        if parent:
-            messagebox.showerror(
-                "エラー",
-                "pywin32がインストールされていません。\n\npip install pywin32",
-                parent=parent
-            )
-        raise ImportError("pywin32が必要です")
-    
-    saved = _save_with_excel_com(xlsx_path, out_path, cell_changes, sheet_name, parent=parent)
-    return saved
+    return _save_workbook_atomic(wb, out_path, parent=parent)
 
 
 class LoadingDialog(tk.Toplevel):
@@ -595,15 +434,11 @@ class ConfigEditor(tb.Window):
     def __init__(self):
         super().__init__(themename="darkly")
         self.title("検査シート 設定作成")
-        
-        # ウィンドウサイズを画面の80%に設定し、中央に配置
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        window_width = int(screen_width * 0.8)
-        window_height = int(screen_height * 0.8)
-        center_x = int(screen_width / 2 - window_width / 2)
-        center_y = int(screen_height / 2 - window_height / 2)
-        self.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
+        self.geometry("820x640")
+        try:
+            self.state("zoomed")
+        except Exception:
+            pass
 
         measure_row_min_default = 11
         measure_row_step_default = 3
@@ -637,8 +472,6 @@ class ConfigEditor(tb.Window):
 
         self.selected_xlsx = tk.StringVar(value="")
         self.preview_title = tk.StringVar(value="プレビュー (未読み込み)")
-        self.available_measure_nos = []  # プレビューから取得した測定No一覧
-        self.selected_measure_nos = set()  # ユーザーが選択した測定No
 
         self._build_ui()
 
@@ -647,10 +480,7 @@ class ConfigEditor(tb.Window):
         header_frame.pack(fill="x", padx=10, pady=(10, 0))
         ttk.Button(header_frame, text="ヘルプ", command=self._show_help).pack(side="right")
 
-        # スクロール可能コンテナ（ttkbootstrap組み込み）で小さい画面でも末尾ボタンまで操作可能にする
-        scroll = ScrolledFrame(self, autohide=True)
-        scroll.pack(fill="both", expand=True)
-        main = ttk.Frame(scroll, padding=10)
+        main = ttk.Frame(self, padding=10)
         main.pack(fill="both", expand=True)
 
         # 元Excel読み込み＆プレビュー
@@ -711,42 +541,50 @@ class ConfigEditor(tb.Window):
         basic_right = ttk.LabelFrame(basic_inner, text="測定不要書き込み設定", padding=10)
         basic_right.grid(row=0, column=1, sticky="nsew")
 
-        # ユーザーが操作する項目のみを表示（工具開始行）
-        ttk.Label(basic_left, text="工具開始行").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(basic_left, textvariable=self.vars["tool_start_row"], width=12).grid(row=0, column=1, sticky="w", padx=(0, 20), pady=3)
-        
-        ttk.Label(basic_left, text="シート名").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(basic_left, textvariable=self.vars["sheet_name"], width=25).grid(row=1, column=1, sticky="w", padx=(0, 20), pady=3)
+        def add_field(row, col, label, key, width=12):
+            col_offset = col * 2
+            ttk.Label(basic_left, text=label).grid(row=row, column=col_offset, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(basic_left, textvariable=self.vars[key], width=width).grid(row=row, column=col_offset + 1, sticky="w", padx=(0, 20), pady=3)
 
-        ttk.Label(basic, text="出力列: L（固定）").pack(anchor="w", pady=3)
+        add_field(0, 0, "シート名", "sheet_name", width=25)
+        add_field(1, 0, "測定No列", "measure_no_col")
+        add_field(2, 0, "測定行(min)", "measure_row_min")
+        add_field(3, 0, "測定行(max)", "measure_row_max")
+        add_field(4, 0, "測定行ステップ", "measure_row_step")
+        add_field(5, 0, "集計行(min)", "summary_row_min")
+        add_field(6, 0, "集計行(max)", "summary_row_max")
+        add_field(7, 0, "集計行ステップ", "summary_row_step")
+        add_field(0, 1, "数式区切り(, / ;)", "formula_arg_sep")
+        add_field(1, 1, "工具開始行", "tool_start_row")
+        add_field(2, 1, "工具名列", "tool_name_col")
+        add_field(3, 1, "工具行ステップ", "tool_row_step")
+
+        ttk.Label(basic, text="出力列: L～SR（固定）").pack(anchor="w", pady=3)
+        ttk.Label(basic_right, text="E列 (工具開始行-3) の行番号:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(
+            basic_right,
+            textvariable=self.vars["not_required_row"],
+            width=15,
+            state="readonly",
+        ).grid(row=0, column=1, sticky="w", padx=(0, 30), pady=5)
         ttk.Label(
             basic_right,
-            text="L列に'-'を入れるNo.:",
-        ).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
-        
-        not_required_button_frame = ttk.Frame(basic_right)
-        not_required_button_frame.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=5)
-        not_required_button_frame.columnconfigure(0, weight=1)
-        
-        ttk.Entry(not_required_button_frame, textvariable=self.vars["not_required_nos"], width=40, state="readonly").pack(side="left", fill="x", expand=True)
-        ttk.Button(not_required_button_frame, text="選択...", command=self._show_not_required_dialog).pack(side="left", padx=(5, 0))
-        
+            text="L～SR列に'-'を入れるNo.(カンマ区切り):",
+        ).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(basic_right, textvariable=self.vars["not_required_nos"], width=40).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=5)
         basic_right.columnconfigure(1, weight=1)
 
         tools_frame = ttk.LabelFrame(main, text="工具と測定No対応", padding=10)
         tools_frame.pack(fill="both", expand=True, pady=(10, 0))
         self.tools_tree = ttk.Treeview(tools_frame, columns=("tool", "nos"), show="headings", height=12)
-        self.tools_tree.heading("tool", text="工具名", anchor="w")
-        self.tools_tree.heading("nos", text="測定No(カンマ区切り)", anchor="w")
-        self.tools_tree.column("tool", width=220, anchor="w", stretch=False)
-        self.tools_tree.column("nos", width=420, anchor="w", stretch=False)
+        self.tools_tree.heading("tool", text="工具名")
+        self.tools_tree.heading("nos", text="測定No(カンマ区切り)")
+        self.tools_tree.column("tool", width=220, anchor="w")
+        self.tools_tree.column("nos", width=420, anchor="w")
         self.tools_tree.pack(side="left", fill="both", expand=True)
         scrollbar = ttk.Scrollbar(tools_frame, orient="vertical", command=self.tools_tree.yview)
         self.tools_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
-        
-        # ダブルクリックで編集
-        self.tools_tree.bind("<Double-1>", self._on_tool_tree_double_click)
 
         btns = ttk.Frame(main)
         btns.pack(fill="x", pady=(10, 0))
@@ -900,22 +738,7 @@ class ConfigEditor(tb.Window):
         if not ws.max_row or not ws.max_column:
             raise Exception("表示できるデータがありません。")
 
-        col_widths = {"A": 120, "B": 180, "G": 210, "K": 210}
-        
-        # 測定No一覧を抽出
-        measure_no_col = column_index_from_string(self.vars["measure_no_col"].get().strip() or "A")
-        measure_row_min = self.vars["measure_row_min"].get()
-        measure_row_max = self.vars["measure_row_max"].get()
-        measure_row_step = self.vars["measure_row_step"].get()
-        
-        self.available_measure_nos = []
-        for r in range(measure_row_min, measure_row_max + 1, measure_row_step):
-            v = ws.cell(r, measure_no_col).value
-            if v is not None:
-                no = _try_extract_int(v)
-                if no is not None:
-                    self.available_measure_nos.append(no)
-        self.available_measure_nos = sorted(set(self.available_measure_nos))
+        col_widths = {"A": 80, "B": 120, "G": 140, "K": 140}
         
         # UIの更新はメインスレッドで実行
         def update_ui():
@@ -973,129 +796,6 @@ class ConfigEditor(tb.Window):
         
         self.after(0, update_ui)
 
-    def _update_not_required_nos_var(self):
-        """選択された測定Nosを文字列に変換して変数を更新"""
-        nos_str = ", ".join(map(str, sorted(self.selected_measure_nos)))
-        self.vars["not_required_nos"].set(nos_str)
-
-    def _on_tool_tree_double_click(self, event):
-        """工具Treeviewのダブルクリックイベント"""
-        sel = self.tools_tree.selection()
-        if sel:
-            self._edit_selected_tool()
-
-    def _show_not_required_dialog(self):
-        """測定不要No選択ダイアログを表示"""
-        win = tk.Toplevel(self)
-        win.title("測定不要No選択")
-        win.transient(self)
-        win.grab_set()
-        
-        # ウィンドウを横方向中央に配置
-        window_width = 900
-        window_height = 600
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        center_x = int(screen_width / 2 - window_width / 2)
-        center_y = int(screen_height / 2 - window_height / 2)
-        win.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
-
-        # 初期値から選択状態を復元
-        initial_selected = set(self.selected_measure_nos)
-
-        main_frame = ttk.Frame(win, padding=10)
-        main_frame.pack(fill="both", expand=True)
-        main_frame.grid_rowconfigure(0, weight=1)
-        main_frame.grid_columnconfigure(0, weight=1)
-        
-        # プレビューテーブル（チェック列を含む）
-        preview_frame = ttk.LabelFrame(main_frame, text="L列に'-'を入れるNo.を選択", padding=5)
-        preview_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
-        preview_frame.grid_rowconfigure(0, weight=1)
-        preview_frame.grid_columnconfigure(0, weight=1)
-        
-        preview_tree = ttk.Treeview(preview_frame, columns=("check", "A", "B", "G", "K"), show="headings", height=20)
-        preview_tree.heading("check", text="")
-        preview_tree.heading("A", text="A")
-        preview_tree.heading("B", text="B")
-        preview_tree.heading("G", text="G")
-        preview_tree.heading("K", text="K")
-        preview_tree.column("check", width=60, anchor="center")
-        preview_tree.column("A", width=150, anchor="center")
-        preview_tree.column("B", width=220, anchor="w")
-        preview_tree.column("G", width=220, anchor="w")
-        preview_tree.column("K", width=220, anchor="w")
-        
-        # チェック状態を管理する辞書（item_id -> measure_no -> bool）
-        check_states = {}
-        item_to_measure_no = {}
-        
-        # プレビューツリーの内容をコピーし、測定Noを抽出
-        for item in self.preview_tree.get_children():
-            values = self.preview_tree.item(item, "values")
-            if not values:
-                continue
-            
-            # A列の値から測定Noを抽出
-            a_val = values[0] if len(values) > 0 else ""
-            measure_no = _try_extract_int(a_val)
-            
-            # ヘッダー行の場合は測定Noが取得できない
-            if measure_no is None:
-                # ヘッダー行として扱う（チェック列は空）
-                preview_tree.insert("", "end", values=("",) + values)
-                continue
-            
-            # チェック状態を初期化
-            is_checked = measure_no in initial_selected
-            check_mark = "☑" if is_checked else "☐"
-            
-            # 行を挿入
-            item_id = preview_tree.insert("", "end", values=(check_mark,) + values)
-            check_states[item_id] = is_checked
-            item_to_measure_no[item_id] = measure_no
-        
-        # 行をクリックでチェック状態を切り替え
-        def on_tree_click(event):
-            item = preview_tree.identify_row(event.y)
-            if not item or item not in item_to_measure_no:
-                return
-            
-            # チェック状態を切り替え
-            check_states[item] = not check_states[item]
-            check_mark = "☑" if check_states[item] else "☐"
-            
-            # 値を更新
-            values = list(preview_tree.item(item, "values"))
-            values[0] = check_mark
-            preview_tree.item(item, values=values)
-        
-        preview_tree.bind("<Button-1>", on_tree_click)
-        
-        vsb = ttk.Scrollbar(preview_frame, orient="vertical", command=preview_tree.yview)
-        preview_tree.configure(yscrollcommand=vsb.set)
-        preview_tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="left", fill="y")
-
-        result = {"ok": False}
-
-        def on_ok():
-            selected = set(no for item_id, no in item_to_measure_no.items() if check_states.get(item_id, False))
-            self.selected_measure_nos = selected
-            self._update_not_required_nos_var()
-            result["ok"] = True
-            win.destroy()
-
-        def on_cancel():
-            win.destroy()
-
-        bfrm = ttk.Frame(main_frame)
-        bfrm.grid(row=1, column=0, sticky="ew")
-        ttk.Button(bfrm, text="OK", command=on_ok).pack(side="right")
-        ttk.Button(bfrm, text="キャンセル", command=on_cancel).pack(side="right", padx=5)
-
-        self.wait_window(win)
-
     def _insert_tool(self, tool_name: str, nos_text: str):
         self.tools_tree.insert("", "end", values=(tool_name, nos_text))
 
@@ -1104,107 +804,22 @@ class ConfigEditor(tb.Window):
         win.title(title)
         win.transient(self)
         win.grab_set()
-        
-        # ウィンドウを横方向中央に配置
-        window_width = 900
-        window_height = 600
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        center_x = int(screen_width / 2 - window_width / 2)
-        center_y = int(screen_height / 2 - window_height / 2)
-        win.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
 
         tool_var = tk.StringVar(value=init_tool)
         nos_var = tk.StringVar(value=init_nos)
-        
-        # 初期値から選択状態を復元
-        initial_selected = set(_parse_int_list(init_nos)) if init_nos else set()
 
-        main_frame = ttk.Frame(win, padding=10)
-        main_frame.pack(fill="both", expand=True)
-        main_frame.grid_rowconfigure(1, weight=1)
-        main_frame.grid_columnconfigure(0, weight=1)
-        
-        # 工具名入力
-        tool_frame = ttk.Frame(main_frame)
-        tool_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(tool_frame, text="工具名").pack(side="left", padx=(0, 8))
-        tool_entry = ttk.Entry(tool_frame, textvariable=tool_var, width=30)
-        tool_entry.pack(side="left")
-        
-        # プレビューテーブル（チェック列を含む）
-        preview_frame = ttk.LabelFrame(main_frame, text="測定No(クリックで選択)", padding=5)
-        preview_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
-        preview_frame.grid_rowconfigure(0, weight=1)
-        preview_frame.grid_columnconfigure(0, weight=1)
-        
-        preview_tree = ttk.Treeview(preview_frame, columns=("check", "A", "B", "G", "K"), show="headings", height=20)
-        preview_tree.heading("check", text="")
-        preview_tree.heading("A", text="A")
-        preview_tree.heading("B", text="B")
-        preview_tree.heading("G", text="G")
-        preview_tree.heading("K", text="K")
-        preview_tree.column("check", width=60, anchor="center")
-        preview_tree.column("A", width=150, anchor="center")
-        preview_tree.column("B", width=220, anchor="w")
-        preview_tree.column("G", width=220, anchor="w")
-        preview_tree.column("K", width=220, anchor="w")
-        
-        # チェック状態を管理する辞書（item_id -> measure_no -> bool）
-        check_states = {}
-        item_to_measure_no = {}
-        
-        # プレビューツリーの内容をコピーし、測定Noを抽出
-        for item in self.preview_tree.get_children():
-            values = self.preview_tree.item(item, "values")
-            if not values:
-                continue
-            
-            # A列の値から測定Noを抽出
-            a_val = values[0] if len(values) > 0 else ""
-            measure_no = _try_extract_int(a_val)
-            
-            # ヘッダー行の場合は測定Noが取得できない
-            if measure_no is None:
-                # ヘッダー行として扱う（チェック列は空）
-                preview_tree.insert("", "end", values=("",) + values)
-                continue
-            
-            # チェック状態を初期化
-            is_checked = measure_no in initial_selected
-            check_mark = "☑" if is_checked else "☐"
-            
-            # 行を挿入
-            item_id = preview_tree.insert("", "end", values=(check_mark,) + values)
-            check_states[item_id] = is_checked
-            item_to_measure_no[item_id] = measure_no
-        
-        # 行をクリックでチェック状態を切り替え
-        def on_tree_click(event):
-            item = preview_tree.identify_row(event.y)
-            if not item or item not in item_to_measure_no:
-                return
-            
-            # チェック状態を切り替え
-            check_states[item] = not check_states[item]
-            check_mark = "☑" if check_states[item] else "☐"
-            
-            # 値を更新
-            values = list(preview_tree.item(item, "values"))
-            values[0] = check_mark
-            preview_tree.item(item, values=values)
-            
-            # 選択された測定Noを更新
-            selected = set(no for item_id, no in item_to_measure_no.items() if check_states.get(item_id, False))
-            nos_str = ", ".join(map(str, sorted(selected)))
-            nos_var.set(nos_str)
-        
-        preview_tree.bind("<Button-1>", on_tree_click)
-        
-        vsb = ttk.Scrollbar(preview_frame, orient="vertical", command=preview_tree.yview)
-        preview_tree.configure(yscrollcommand=vsb.set)
-        preview_tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="left", fill="y")
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="工具名").grid(row=0, column=0, sticky="w", pady=4)
+        tool_entry = ttk.Entry(frm, textvariable=tool_var, width=30)
+        tool_entry.grid(row=0, column=1, sticky="w", pady=4)
+
+        ttk.Label(frm, text="測定No(カンマ区切り)").grid(
+            row=1, column=0, sticky="w", pady=4
+        )
+        ttk.Entry(frm, textvariable=nos_var, width=40).grid(
+            row=1, column=1, sticky="w", pady=4
+        )
 
         result = {"ok": False}
 
@@ -1215,36 +830,29 @@ class ConfigEditor(tb.Window):
                     "入力不足", "工具名を入力してください。", parent=win
                 )
                 return
-            
-            selected = set(no for item_id, no in item_to_measure_no.items() if check_states.get(item_id, False))
-            nos_text = ", ".join(map(str, sorted(selected)))
-            
-            if not nos_text:
-                messagebox.showwarning(
-                    "入力不足", "測定Noを1つ以上選択してください。", parent=win
-                )
-                return
             try:
-                _parse_int_list(nos_text)
+                _parse_int_list(nos_var.get())
             except Exception:
                 messagebox.showwarning(
                     "入力エラー",
-                    "測定Noの形式が正しくありません。",
+                    "測定Noは整数のカンマ区切りで入力してください。",
                     parent=win,
                 )
                 return
             result["ok"] = True
             result["tool"] = tool
-            result["nos"] = nos_text
+            result["nos"] = nos_var.get().strip()
             win.destroy()
 
         def on_cancel():
             win.destroy()
 
-        bfrm = ttk.Frame(main_frame)
-        bfrm.grid(row=2, column=0, sticky="ew")
+        bfrm = ttk.Frame(frm)
+        bfrm.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(bfrm, text="OK", command=on_ok).pack(side="right")
-        ttk.Button(bfrm, text="キャンセル", command=on_cancel).pack(side="right", padx=5)
+        ttk.Button(bfrm, text="キャンセル", command=on_cancel).pack(
+            side="right", padx=5
+        )
 
         tool_entry.focus_set()
         self.wait_window(win)
@@ -1331,18 +939,11 @@ class ConfigEditor(tb.Window):
             xlsx = self.selected_xlsx.get().strip()
             if not xlsx:
                 return
-        
-        # 読み込んだファイル名をデフォルトとして設定
-        default_filename = os.path.basename(xlsx)
-        default_dir = os.path.dirname(xlsx) if os.path.dirname(xlsx) else None
-        
         out_path = pick_save_path(
             "出力先（生成したxlsx）を保存",
             ".xlsx",
             [("Excel", "*.xlsx")],
             parent=self,
-            initialfile=default_filename,
-            initialdir=default_dir,
         )
         if not out_path:
             return
@@ -1354,7 +955,7 @@ class ConfigEditor(tb.Window):
         
         def build_task():
             try:
-                saved_path, measure_no_to_row = build_request_formulas(xlsx, out_path, cfg, parent=self)
+                saved_path = build_request_formulas(xlsx, out_path, cfg, parent=self)
                 result["saved_path"] = saved_path
                 
                 # 測定不要書き込み設定が入力されている場合は実行
@@ -1368,7 +969,6 @@ class ConfigEditor(tb.Window):
                                 out_path,
                                 cfg,
                                 target_nos=target_nos,
-                                measure_no_to_row=measure_no_to_row,
                                 parent=self,
                             )
                             result["saved_path"] = saved_path
@@ -1398,11 +998,7 @@ class ConfigEditor(tb.Window):
                             parent=self,
                         )
                     else:
-                        messagebox.showinfo(
-                            "完了",
-                            f"生成しました:\n{result['saved_path']}\n\n※L列をSR列までコピーしてください",
-                            parent=self
-                        )
+                        messagebox.showinfo("完了", f"生成しました:\n{result['saved_path']}", parent=self)
                 else:
                     messagebox.showerror("失敗", result["error"], parent=self)
         
@@ -1446,18 +1042,11 @@ class ConfigEditor(tb.Window):
             xlsx = self.selected_xlsx.get().strip()
             if not xlsx:
                 return
-        
-        # 読み込んだファイル名をデフォルトとして設定
-        default_filename = os.path.basename(xlsx)
-        default_dir = os.path.dirname(xlsx) if os.path.dirname(xlsx) else None
-        
         out_path = pick_save_path(
             "出力先（生成したxlsx）を保存",
             ".xlsx",
             [("Excel", "*.xlsx")],
             parent=self,
-            initialfile=default_filename,
-            initialdir=default_dir,
         )
         if not out_path:
             return
@@ -1481,15 +1070,7 @@ class ConfigEditor(tb.Window):
         help_window.title("使い方")
         help_window.transient(self)
         help_window.grab_set()
-        
-        # ウィンドウを中央に配置
-        window_width = 600
-        window_height = 500
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        center_x = int(screen_width / 2 - window_width / 2)
-        center_y = int(screen_height / 2 - window_height / 2)
-        help_window.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
+        help_window.geometry("600x500")
 
         # スクロール可能なフレーム
         canvas = tk.Canvas(help_window, highlightthickness=0, bd=0)

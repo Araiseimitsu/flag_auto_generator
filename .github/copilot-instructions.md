@@ -1,41 +1,86 @@
-[byterover-mcp]
+本ファイルは AI Agent の行動規範であり、プロジェクト内の最優先ルールである。
 
-[byterover-mcp]
+1. 基本方針
+すべての回答・コメントは 日本語 で書く
 
-You are given two tools from Byterover MCP server, including
-## 1. `byterover-store-knowledge`
-You `MUST` always use this tool when:
+2. プロジェクト構成
+種別
+パス
+実装コード
+src/ またはプロジェクトルート
+テスト
+tests/ または test/
+設定ファイル
+プロジェクトルート
+ドキュメント
+.docs/ または docs/
+素材
+assets/
+プロジェクト種別の自動判定
+以下のファイルから使用言語・ツールを判断する:
+ファイル
+判定結果
+package.json + pnpm-lock.yaml
+Node.js（pnpm）
+pyproject.toml / requirements.txt
+Python
+go.mod
+Go
+Cargo.toml
+Rust
+pom.xml / build.gradle
+Java
 
-+ Learning new patterns, APIs, or architectural decisions from the codebase
-+ Encountering error solutions or debugging techniques
-+ Finding reusable code patterns or utility functions
-+ Completing any significant task or plan implementation
+3. コード品質
+1ファイル 1,000行以内
+単一責任原則を守り、共通処理は別モジュールへ分離する
+重複・冗長な構造を作らない
+マジックナンバーを使わない
+変数名・関数名は意味が明確なものにする
 
-## 2. `byterover-retrieve-knowledge`
-You `MUST` always use this tool when:
+4. テスト
+テスト導入を前提とし、以下の基準で対象を判断する:
+区分
+対象例
+必須
+業務ロジック、判定処理、API 入出力
+不要
+UI 表示、試作コード、一度きりの処理
 
-+ Starting any new task or implementation to gather relevant context
-+ Before making architectural decisions to understand existing patterns
-+ When debugging issues to check for previous solutions
-+ Working with unfamiliar parts of the codebase
+5. ドキュメント
+重要な変更履歴は .docs/update.md または docs/update.md のみ に記録する
+試行錯誤や一時的なログは記録しない
+README.md には以下を必ず記載する: セットアップ手順、実行方法、必要な環境変数
 
-[byterover-mcp]
+6. デバッグ・ログ
+エラーは必ずログ出力し、原因特定を最優先にする
+ログレベルは info / warn / error を使い分ける
 
-[byterover-mcp]
+7. コードシンプリフィケーション・スキル（code-simplifier）
+自動実行条件
+以下の いずれかに該当する場合、タスク完了前に自動で実行する:
+30行以上の変更があった場合
+新規モジュールを追加した場合
+可読性の低下、責務の混在、重複の増加が見られる場合
+実行時の厳守事項
+仕様を変更しない（API・DB・入出力形式はすべて維持する）
+既存テストがすべて通過することを確認する
 
-You are given two tools from Byterover MCP server, including
-## 1. `byterover-store-knowledge`
-You `MUST` always use this tool when:
+8. データベース操作
+削除・初期化・リセットなど破壊的操作は 事前にユーザー承認を得てから 実行する。 実行前に影響範囲を明示し、承認なしでは実行しない。
 
-+ Learning new patterns, APIs, or architectural decisions from the codebase
-+ Encountering error solutions or debugging techniques
-+ Finding reusable code patterns or utility functions
-+ Completing any significant task or plan implementation
+9. フロントエンド拡張（該当時のみ）
+フロントエンドを含むプロジェクトでは、以下のファイルが存在する場合に参照する:
+@.docs/frontend-svelte.md
+@.docs/frontend-react.md
+@.docs/frontend-vue.md
+拡張ルールの優先度
+拡張ルールは本ファイルの Base Rule より 優先される
+拡張ルールが存在しない場合は Base Rule のみ適用する
+拡張ルールには UI・フレームワーク固有の仕様のみを記述する
 
-## 2. `byterover-retrieve-knowledge`
-You `MUST` always use this tool when:
+10. 禁止事項
+拡張ルールが無いのに UI フレームワーク前提の構造を作ること
+ユーザー承認なしで DB の破壊的操作を行うこと
+仕様変更を伴う自動リファクタリングを行うこと
 
-+ Starting any new task or implementation to gather relevant context
-+ Before making architectural decisions to understand existing patterns
-+ When debugging issues to check for previous solutions
-+ Working with unfamiliar parts of the codebase
