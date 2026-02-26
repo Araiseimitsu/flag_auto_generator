@@ -40,3 +40,5 @@
 - openpyxl読み込み時に `keep_links=False` を適用し、外部リンク情報（externalLinks）の出力持ち越しを抑制。
 - Excel COM側の保存処理を `SaveAs(FileFormat=51)` 優先に変更し、出力ファイルの内部構造を再構築して修復ログ発生を抑制。
 - openpyxl保存後に、元テンプレートの `xl/drawings/*` と `xl/externalLinks/*` パーツを出力ファイルへ復元コピーする処理を追加し、修復ログ（drawing/externalLinks）の発生抑制を強化。
+- UIの「ヘルプ」内容を最新仕様に更新し、自動測定結果反映・測定不要書き込み・Excel生成時の処理順が分かるように整理。
+- `README.md` を新規作成し、セットアップ手順・実行方法・必要環境変数（なし）を明記。
