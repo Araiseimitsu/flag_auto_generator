@@ -396,6 +396,14 @@ def _build_request_header_formula(
     )
 
 
+def _build_request_formula(conditions: str, fallback_expression: str = '""') -> str:
+    return f'=IF(OR({conditions}),"依頼",{fallback_expression})'
+
+
+def _strip_formula_prefix(formula_text: str) -> str:
+    return formula_text[1:] if isinstance(formula_text, str) and formula_text.startswith("=") else str(formula_text)
+
+
 def _normalize_formula_text(value) -> str:
     if value is None:
         return ""
@@ -507,6 +515,8 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
                 continue
             measure_row_to_tool_rows.setdefault(mr, []).append(tr)
 
+    all_tool_rows = sorted(tool_row.values())
+
     _ensure_summary_formulas(ws)
 
     # 4) 測定行に依頼セルを設定
@@ -516,13 +526,23 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
         col_letter = get_column_letter(col_idx)
         header_cell = ws.cell(REQUEST_HEADER_ROW, col_idx)
         if _can_overwrite_with_formula(header_cell.value):
-            header_cell.value = _build_request_header_formula(
+            header_formula = _build_request_header_formula(
                 col_letter=col_letter,
                 measure_row_min=measure_row_min,
                 measure_row_max=measure_row_max,
                 measure_row_step=measure_row_step,
                 sep=formula_arg_sep,
             )
+            if all_tool_rows:
+                summary_conds = formula_arg_sep.join(
+                    [f'{col_letter}${tr}<>""' for tr in all_tool_rows]
+                )
+                header_cell.value = _build_request_formula(
+                    summary_conds,
+                    _strip_formula_prefix(header_formula),
+                )
+            else:
+                header_cell.value = header_formula
 
         # 測定行に依頼セルを設定
         for mr, tool_rows in measure_row_to_tool_rows.items():
@@ -540,9 +560,9 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
                     data_index=data_index,
                     sep=formula_arg_sep,
                 )
-                target_cell.value = f'=IF(OR({conds}),"依頼",{auto_formula})'
+                target_cell.value = _build_request_formula(conds, auto_formula)
             else:
-                target_cell.value = f'=IF(OR({conds}),"依頼","")'
+                target_cell.value = _build_request_formula(conds)
             written += 1
 
         # 工具に紐づかない行には自動測定データ反映式のみを設定
@@ -1655,8 +1675,14 @@ class ConfigEditor(tb.Window):
 
     【工具と測定No対応】
     1. 「工具追加」で工具名と測定No（カンマ区切り）を登録します
-    2. 登録した測定Noの行に、列ごとに「依頼」判定式が設定されます
-    3. 同じ測定Noが自動測定データ対応にもある場合は、工具条件が成立すると「依頼」を優先します
+    2. 工具行の同じ列に値が入った場合、10行目も「依頼」になります
+    3. 登録した測定Noの行に、列ごとに「依頼」判定式が設定されます
+    4. 同じ測定Noが自動測定データ対応にもある場合は、工具条件が成立すると「依頼」を優先します
+
+    【注意】
+    1. 生成したファイルを開くと「作成されたファイルを修正しますか？」と表示される場合があります
+    2. その場合は「はい」を押して進めてください
+    3. 書式やレイアウトが変わっている場合は、必要な関数のみを既存のExcelへ貼り付けて使用してください
 
     【自動測定結果の反映】
     1. 「自動測定データ開始行」は既定で230行です
