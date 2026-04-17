@@ -299,6 +299,28 @@ def _build_auto_data_formula(col_letter: str, data_start_row: int, data_index: i
     )
 
 
+def _to_formula_expression(value):
+    if _is_empty_cell_value(value):
+        return '""'
+    if isinstance(value, str) and value.startswith("="):
+        return value[1:]
+    if isinstance(value, str):
+        escaped = value.replace('"', '""')
+        return f'"{escaped}"'
+    return str(value)
+
+
+def _build_not_required_overlay_formula(
+    current_value,
+    trigger_cell_ref: str,
+    sep: str,
+):
+    base_expression = _to_formula_expression(current_value)
+    return (
+        f'=IF(IFERROR(LEN(TRIM({trigger_cell_ref}&"")){sep}0)>0{sep}"-"{sep}{base_expression})'
+    )
+
+
 def _is_empty_cell_value(value):
     if value is None:
         return True
@@ -466,7 +488,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
     # 2.5) 自動測定データ開始行のE列に案内を記入
     auto_data_label_cell = ws.cell(auto_data_start_row, tool_name_c)
-    auto_data_label_cell.value = '測定結果貼付は230行から'
+    auto_data_label_cell.value = f"測定結果貼付は{auto_data_start_row}行から"
 
     # 3) 測定行ごとに参照すべき工具行（逆引き）
     measure_row_to_tool_rows = {}
@@ -509,7 +531,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             data_index = measure_no_to_data_index.get(measure_no)
             target_found += 1
             target_cell = ws.cell(mr, col_idx)
-            if not _is_empty_cell_value(target_cell.value):
+            if not _can_overwrite_with_formula(target_cell.value):
                 continue
             if data_index is not None:
                 auto_formula = _build_auto_data_formula(
@@ -530,7 +552,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
                 continue
             target_found += 1
             target_cell = ws.cell(mr, col_idx)
-            if not _is_empty_cell_value(target_cell.value):
+            if not _can_overwrite_with_formula(target_cell.value):
                 continue
             auto_formula = _build_auto_data_formula(
                 col_letter=col_letter,
@@ -592,7 +614,7 @@ def write_measurement_not_required(
     xlsx_path: str,
     out_path: str,
     cfg: dict,
-    target_nos: list = None,
+    target_nos: list | None = None,
     *,
     parent=None,
 ):
@@ -618,6 +640,7 @@ def write_measurement_not_required(
     measure_row_min = int(cfg.get("measure_row_min", 11))
     measure_row_step = int(cfg.get("measure_row_step", 3))
     measure_row_max = int(cfg.get("measure_row_max", tool_start_row - 4))
+    formula_arg_sep = str(cfg.get("formula_arg_sep", ",")).strip() or ","
 
     wb = load_workbook(xlsx_path)
     wb_values = load_workbook(xlsx_path, data_only=True)
@@ -686,11 +709,14 @@ def write_measurement_not_required(
         for col_idx in range(flag_col_start, flag_col_end + 1):
             col_letter = get_column_letter(col_idx)
             target_cell = f"{col_letter}{target_row}"
-            formula = f'=IF(IFERROR(LEN(TRIM({target_cell}&"")),0)>0,"-","")'
             current_cell = ws.cell(row, col_idx)
             if not _can_overwrite_with_formula(current_cell.value):
                 continue
-            current_cell.value = formula
+            current_cell.value = _build_not_required_overlay_formula(
+                current_cell.value,
+                target_cell,
+                formula_arg_sep,
+            )
         written_count += 1
 
     if written_count == 0 and target_nos:
@@ -1623,7 +1649,7 @@ class ConfigEditor(tb.Window):
     4. 出力列は L～SR 固定です
 
     【先頭集計式の注意】
-    1. 1行目の基準式は =SUMPRODUCT(--(L9:L308<>""),--(MOD(ROW(L9:L308)-ROW(L9),2)=0)) です
+    1. 1行目の基準式は =SUMPRODUCT(--(L11:L308<>""),--(MOD(ROW(L11:L308)-ROW(L11),2)=0)) です
     2. 1行目がこの形式でない場合は、L〜SN列の1〜3行目に同パターンの式を補正投入します
     3. 2行目・3行目は1行目を貼り付けた相対参照と同じ内容で設定します
 
@@ -1640,7 +1666,7 @@ class ConfigEditor(tb.Window):
     【測定不要書き込み設定（任意）】
     1. No.欄に測定Noを入れると、生成後に追加処理として測定不要式を設定します
     2. 工具開始行-3行目のE列には「測定不要」を書き込みます
-    3. 指定Noの行のL～SRには、同列の「測定不要」行が入力されたときだけ「-」を表示する式を設定します
+    3. 指定Noの行のL～SRには、同列の「測定不要」行が入力されたときだけ「-」を表示し、未入力時は既存の依頼式・自動測定式をそのまま動かす式を設定します
 
     【Excel生成の処理順】
     1. 「この設定でExcel生成」を押して出力先を指定します
