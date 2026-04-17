@@ -1,13 +1,12 @@
 ﻿import os
 import re
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import threading
 import time
 import zipfile
 
 import ttkbootstrap as tb
-from ttkbootstrap import ttk
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.worksheet.formula import ArrayFormula
@@ -15,6 +14,22 @@ from openpyxl.worksheet.formula import ArrayFormula
 
 AUTO_DATA_START_ROW_DEFAULT = 230
 AUTO_DATA_MAX_ITEMS = 100
+SUMMARY_FORMULA_COL_START = "L"
+SUMMARY_FORMULA_COL_END = "SN"
+REQUEST_OUTPUT_COL_START = "L"
+REQUEST_OUTPUT_COL_END = "SR"
+SUMMARY_FORMULA_BASE_START_ROW = 9
+SUMMARY_FORMULA_BASE_END_ROW = 308
+LOCKED_BASIC_SETTINGS = {
+    "measure_no_col": "A",
+    "measure_row_min": 11,
+    "measure_row_step": 3,
+    "summary_row_min": 11,
+    "summary_row_step": 3,
+    "formula_arg_sep": ",",
+    "tool_name_col": "E",
+    "tool_row_step": 3,
+}
 
 
 def pick_file(title: str, filetypes, parent=None):
@@ -333,6 +348,41 @@ def _normalize_single_cell_array_formulas_in_column(
     return rewritten
 
 
+def _build_summary_formula(col_letter: str, row_offset: int) -> str:
+    start_row = SUMMARY_FORMULA_BASE_START_ROW + row_offset
+    end_row = SUMMARY_FORMULA_BASE_END_ROW + row_offset
+    return (
+        f"=SUMPRODUCT(--({col_letter}{start_row}:{col_letter}{end_row}<>\"\"),"
+        f"--(MOD(ROW({col_letter}{start_row}:{col_letter}{end_row})-ROW({col_letter}{start_row}),2)=0))"
+    )
+
+
+def _normalize_formula_text(value) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", "", str(value)).replace("$", "").upper()
+
+
+def _ensure_summary_formulas(ws):
+    summary_col_start = column_index_from_string(SUMMARY_FORMULA_COL_START)
+    summary_col_end = column_index_from_string(SUMMARY_FORMULA_COL_END)
+
+    for col_idx in range(summary_col_start, summary_col_end + 1):
+        col_letter = get_column_letter(col_idx)
+        expected_row1_formula = _build_summary_formula(col_letter, 0)
+        row1_cell = ws.cell(1, col_idx)
+        if _normalize_formula_text(row1_cell.value) == _normalize_formula_text(
+            expected_row1_formula
+        ):
+            continue
+
+        for row_idx in range(1, 4):
+            ws.cell(row_idx, col_idx).value = _build_summary_formula(
+                col_letter,
+                row_idx - 1,
+            )
+
+
 def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=None):
     sheet_name = cfg["sheet_name"]
     measure_no_col = cfg.get("measure_no_col", "A")
@@ -344,8 +394,8 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     summary_row_max = int(cfg.get("summary_row_max", measure_row_max))
     summary_row_step = int(cfg.get("summary_row_step", measure_row_step))
     formula_arg_sep = str(cfg.get("formula_arg_sep", ",")).strip() or ","
-    flag_col_start = column_index_from_string("L")
-    flag_col_end = column_index_from_string("SR")
+    flag_col_start = column_index_from_string(REQUEST_OUTPUT_COL_START)
+    flag_col_end = column_index_from_string(REQUEST_OUTPUT_COL_END)
 
     tool_name_col = cfg.get("tool_name_col", "E")
     tool_row_step = int(cfg.get("tool_row_step", measure_row_step))
@@ -418,49 +468,13 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
                 continue
             measure_row_to_tool_rows.setdefault(mr, []).append(tr)
 
-    # 4) 1～3行目に新しい数式を投入、測定行に依頼セルを設定
+    _ensure_summary_formulas(ws)
+
+    # 4) 測定行に依頼セルを設定
     written = 0
     target_found = 0
     for col_idx in range(flag_col_start, flag_col_end + 1):
         col_letter = get_column_letter(col_idx)
-        
-        # 1行目: SEQUENCE(sequence_count,1,11,3) - measure_row_minから開始
-        formula_row1 = (
-            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
-            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
-        )
-        row1_cell = ws.cell(1, col_idx)
-        if _is_empty_cell_value(row1_cell.value):
-            row1_cell.value = formula_row1
-
-        # 2行目: SEQUENCE(sequence_count,1,12,3) - measure_row_min+1から開始
-        formula_row2 = (
-            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 1}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
-            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 1}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
-        )
-        row2_cell = ws.cell(2, col_idx)
-        if _is_empty_cell_value(row2_cell.value):
-            row2_cell.value = formula_row2
-
-        # 3行目: SEQUENCE(sequence_count,1,13,3) - measure_row_min+2から開始
-        formula_row3 = (
-            f"=SUMPRODUCT((IFERROR(FILTER(INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 2}{formula_arg_sep}{measure_row_step})){formula_arg_sep}"
-            f"INDEX({col_letter}:{col_letter}{formula_arg_sep}"
-            f"SEQUENCE({sequence_count}{formula_arg_sep}1{formula_arg_sep}{measure_row_min + 2}{formula_arg_sep}{measure_row_step}))<>\"\"){formula_arg_sep}\"\")<>\"\")*1)"
-        )
-        row3_cell = ws.cell(3, col_idx)
-        if _is_empty_cell_value(row3_cell.value):
-            row3_cell.value = formula_row3
-
-        # デバッグ用ログ出力
-        print(f"列 {col_letter} 1行目: {formula_row1}")
-        print(f"列 {col_letter} 2行目: {formula_row2}")
-        print(f"列 {col_letter} 3行目: {formula_row3}")
 
         # 測定行に依頼セルを設定
         for mr, tool_rows in measure_row_to_tool_rows.items():
@@ -745,27 +759,27 @@ class ConfigEditor(tb.Window):
         except Exception:
             pass
 
-        measure_row_min_default = 11
-        measure_row_step_default = 3
+        measure_row_min_default = LOCKED_BASIC_SETTINGS["measure_row_min"]
+        measure_row_step_default = LOCKED_BASIC_SETTINGS["measure_row_step"]
         tool_start_default = 200
         measure_row_max_default = max(tool_start_default - 4, measure_row_min_default)
-        summary_row_min_default = measure_row_min_default
+        summary_row_min_default = LOCKED_BASIC_SETTINGS["summary_row_min"]
         summary_row_max_default = measure_row_max_default
-        summary_row_step_default = measure_row_step_default
-        tool_row_step_default = measure_row_step_default
+        summary_row_step_default = LOCKED_BASIC_SETTINGS["summary_row_step"]
+        tool_row_step_default = LOCKED_BASIC_SETTINGS["tool_row_step"]
 
         self.vars = {
             "sheet_name": tk.StringVar(value="工程内検査シート"),
-            "measure_no_col": tk.StringVar(value="A"),
+            "measure_no_col": tk.StringVar(value=LOCKED_BASIC_SETTINGS["measure_no_col"]),
             "measure_row_min": tk.IntVar(value=measure_row_min_default),
             "measure_row_max": tk.IntVar(value=measure_row_max_default),
             "measure_row_step": tk.IntVar(value=measure_row_step_default),
             "summary_row_min": tk.IntVar(value=summary_row_min_default),
             "summary_row_max": tk.IntVar(value=summary_row_max_default),
             "summary_row_step": tk.IntVar(value=summary_row_step_default),
-            "formula_arg_sep": tk.StringVar(value=","),
+            "formula_arg_sep": tk.StringVar(value=LOCKED_BASIC_SETTINGS["formula_arg_sep"]),
             "tool_start_row": tk.IntVar(value=tool_start_default),
-            "tool_name_col": tk.StringVar(value="E"),
+            "tool_name_col": tk.StringVar(value=LOCKED_BASIC_SETTINGS["tool_name_col"]),
             "tool_row_step": tk.IntVar(value=tool_row_step_default),
             "auto_data_start_row": tk.IntVar(value=AUTO_DATA_START_ROW_DEFAULT),
             "not_required_row": tk.StringVar(
@@ -778,6 +792,7 @@ class ConfigEditor(tb.Window):
         self.auto_map_data_index_var = tk.StringVar(value="")
 
         self._bind_basic_setting_sync()
+        self._apply_locked_basic_settings()
 
         self.selected_xlsx = tk.StringVar(value="")
         self.preview_title = tk.StringVar(value="プレビュー (未読み込み)")
@@ -880,24 +895,35 @@ class ConfigEditor(tb.Window):
         basic_right = ttk.LabelFrame(basic_inner, text="測定不要書き込み設定", padding=10)
         basic_right.grid(row=0, column=1, sticky="nsew")
 
-        def add_field(row, col, label, key, width=12):
+        def add_field(row, col, label, key, width=12, editable=True):
             col_offset = col * 2
             ttk.Label(basic_left, text=label).grid(row=row, column=col_offset, sticky="w", padx=(0, 8), pady=3)
-            ttk.Entry(basic_left, textvariable=self.vars[key], width=width).grid(row=row, column=col_offset + 1, sticky="w", padx=(0, 20), pady=3)
+            if editable:
+                ttk.Entry(basic_left, textvariable=self.vars[key], width=width).grid(row=row, column=col_offset + 1, sticky="w", padx=(0, 20), pady=3)
+                return
+            ttk.Label(
+                basic_left,
+                text=str(self.vars[key].get()),
+                width=width,
+            ).grid(row=row, column=col_offset + 1, sticky="w", padx=(0, 20), pady=3)
 
         add_field(0, 0, "シート名", "sheet_name", width=25)
-        add_field(1, 0, "測定No列", "measure_no_col")
-        add_field(2, 0, "測定行(min)", "measure_row_min")
+        add_field(1, 0, "測定No列", "measure_no_col", editable=False)
+        add_field(2, 0, "測定行(min)", "measure_row_min", editable=False)
         add_field(3, 0, "測定行(max)", "measure_row_max")
-        add_field(4, 0, "測定行ステップ", "measure_row_step")
-        add_field(5, 0, "集計行(min)", "summary_row_min")
+        add_field(4, 0, "測定行ステップ", "measure_row_step", editable=False)
+        add_field(5, 0, "集計行(min)", "summary_row_min", editable=False)
         add_field(6, 0, "集計行(max)", "summary_row_max")
-        add_field(7, 0, "集計行ステップ", "summary_row_step")
-        add_field(0, 1, "数式区切り(, / ;)", "formula_arg_sep")
+        add_field(7, 0, "集計行ステップ", "summary_row_step", editable=False)
+        add_field(0, 1, "数式区切り(, / ;)", "formula_arg_sep", editable=False)
         add_field(1, 1, "工具開始行", "tool_start_row")
-        add_field(2, 1, "工具名列", "tool_name_col")
-        add_field(3, 1, "工具行ステップ", "tool_row_step")
+        add_field(2, 1, "工具名列", "tool_name_col", editable=False)
+        add_field(3, 1, "工具行ステップ", "tool_row_step", editable=False)
         add_field(4, 1, "自動測定データ開始行", "auto_data_start_row")
+        ttk.Label(
+            basic,
+            text="固定項目: 測定No列 A / 測定行(min) 11 / 測定行ステップ 3 / 集計行(min) 11 / 集計行ステップ 3 / 数式区切り , / 工具名列 E / 工具行ステップ 3",
+        ).pack(anchor="w", pady=(6, 3))
 
         ttk.Label(basic, text="出力列: L～SR（固定）").pack(anchor="w", pady=3)
         ttk.Label(basic_right, text="E列 (工具開始行-3) の行番号:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
@@ -1005,6 +1031,11 @@ class ConfigEditor(tb.Window):
         self.vars["measure_row_min"].trace_add("write", self._sync_measure_row_min)
         self.vars["measure_row_max"].trace_add("write", self._sync_measure_row_max)
         self.vars["measure_row_step"].trace_add("write", self._sync_measure_row_step)
+
+    def _apply_locked_basic_settings(self):
+        for key, value in LOCKED_BASIC_SETTINGS.items():
+            if self.vars[key].get() != value:
+                self.vars[key].set(value)
 
     def _sync_tool_start_row(self, *args):
         try:
@@ -1334,6 +1365,7 @@ class ConfigEditor(tb.Window):
 
     def _gather_cfg(self):
         try:
+            self._apply_locked_basic_settings()
             tools = []
             tool_to_measure_nos = {}
             measure_no_to_data_index = {}
@@ -1355,17 +1387,17 @@ class ConfigEditor(tb.Window):
 
             cfg = {
                 "sheet_name": self.vars["sheet_name"].get().strip(),
-                "measure_no_col": self.vars["measure_no_col"].get().strip().upper(),
-                "measure_row_min": int(self.vars["measure_row_min"].get()),
+                "measure_no_col": LOCKED_BASIC_SETTINGS["measure_no_col"],
+                "measure_row_min": LOCKED_BASIC_SETTINGS["measure_row_min"],
                 "measure_row_max": int(self.vars["measure_row_max"].get()),
-                "measure_row_step": int(self.vars["measure_row_step"].get()),
-                "summary_row_min": int(self.vars["summary_row_min"].get()),
+                "measure_row_step": LOCKED_BASIC_SETTINGS["measure_row_step"],
+                "summary_row_min": LOCKED_BASIC_SETTINGS["summary_row_min"],
                 "summary_row_max": int(self.vars["summary_row_max"].get()),
-                "summary_row_step": int(self.vars["summary_row_step"].get()),
-                "formula_arg_sep": self.vars["formula_arg_sep"].get().strip(),
+                "summary_row_step": LOCKED_BASIC_SETTINGS["summary_row_step"],
+                "formula_arg_sep": LOCKED_BASIC_SETTINGS["formula_arg_sep"],
                 "tool_start_row": int(self.vars["tool_start_row"].get()),
-                "tool_name_col": self.vars["tool_name_col"].get().strip().upper(),
-                "tool_row_step": int(self.vars["tool_row_step"].get()),
+                "tool_name_col": LOCKED_BASIC_SETTINGS["tool_name_col"],
+                "tool_row_step": LOCKED_BASIC_SETTINGS["tool_row_step"],
                 "auto_data_start_row": int(self.vars["auto_data_start_row"].get()),
                 "measure_no_to_data_index": measure_no_to_data_index,
                 "tools": tools,
@@ -1561,8 +1593,14 @@ class ConfigEditor(tb.Window):
         usage_text = """
     【基本設定】
     1. 先に「Excelを選択」で元ファイルを読み込み、プレビューで対象シートを確認します
-    2. シート名・測定No列・測定行範囲・工具開始行を必要に応じて調整します
-    3. 出力列は L～SR 固定です
+    2. シート名・測定行(max)・集計行(max)・工具開始行を必要に応じて調整します
+    3. 次の項目は固定で変更できません: 測定No列 A / 測定行(min) 11 / 測定行ステップ 3 / 集計行(min) 11 / 集計行ステップ 3 / 数式区切り , / 工具名列 E / 工具行ステップ 3
+    4. 出力列は L～SR 固定です
+
+    【先頭集計式の注意】
+    1. 1行目の基準式は =SUMPRODUCT(--(L9:L308<>""),--(MOD(ROW(L9:L308)-ROW(L9),2)=0)) です
+    2. 1行目がこの形式でない場合は、L〜SN列の1〜3行目に同パターンの式を補正投入します
+    3. 2行目・3行目は1行目を貼り付けた相対参照と同じ内容で設定します
 
     【工具と測定No対応】
     1. 「工具追加」で工具名と測定No（カンマ区切り）を登録します
