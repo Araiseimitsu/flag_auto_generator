@@ -14,6 +14,7 @@ from openpyxl.worksheet.formula import ArrayFormula
 
 AUTO_DATA_START_ROW_DEFAULT = 230
 AUTO_DATA_MAX_ITEMS = 100
+REQUEST_HEADER_ROW = 10
 SUMMARY_FORMULA_COL_START = "L"
 SUMMARY_FORMULA_COL_END = "SN"
 REQUEST_OUTPUT_COL_START = "L"
@@ -357,6 +358,22 @@ def _build_summary_formula(col_letter: str, row_offset: int) -> str:
     )
 
 
+def _build_request_header_formula(
+    col_letter: str,
+    measure_row_min: int,
+    measure_row_max: int,
+    measure_row_step: int,
+    sep: str,
+) -> str:
+    target_range = f"{col_letter}{measure_row_min}:{col_letter}{measure_row_max}"
+    start_ref = f"{col_letter}{measure_row_min}"
+    return (
+        f'=IF(SUMPRODUCT(--({target_range}<>"")){sep}'
+        f'--(MOD(ROW({target_range})-ROW({start_ref}){sep}{measure_row_step})=0))>0{sep}'
+        f'"依頼"{sep}"")'
+    )
+
+
 def _normalize_formula_text(value) -> str:
     if value is None:
         return ""
@@ -475,6 +492,15 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     target_found = 0
     for col_idx in range(flag_col_start, flag_col_end + 1):
         col_letter = get_column_letter(col_idx)
+        header_cell = ws.cell(REQUEST_HEADER_ROW, col_idx)
+        if _can_overwrite_with_formula(header_cell.value):
+            header_cell.value = _build_request_header_formula(
+                col_letter=col_letter,
+                measure_row_min=measure_row_min,
+                measure_row_max=measure_row_max,
+                measure_row_step=measure_row_step,
+                sep=formula_arg_sep,
+            )
 
         # 測定行に依頼セルを設定
         for mr, tool_rows in measure_row_to_tool_rows.items():
@@ -913,7 +939,6 @@ class ConfigEditor(tb.Window):
         add_field(3, 0, "測定行(max)", "measure_row_max")
         add_field(4, 0, "測定行ステップ", "measure_row_step", editable=False)
         add_field(5, 0, "集計行(min)", "summary_row_min", editable=False)
-        add_field(6, 0, "集計行(max)", "summary_row_max")
         add_field(7, 0, "集計行ステップ", "summary_row_step", editable=False)
         add_field(0, 1, "数式区切り(, / ;)", "formula_arg_sep", editable=False)
         add_field(1, 1, "工具開始行", "tool_start_row")
@@ -922,7 +947,7 @@ class ConfigEditor(tb.Window):
         add_field(4, 1, "自動測定データ開始行", "auto_data_start_row")
         ttk.Label(
             basic,
-            text="固定項目: 測定No列 A / 測定行(min) 11 / 測定行ステップ 3 / 集計行(min) 11 / 集計行ステップ 3 / 数式区切り , / 工具名列 E / 工具行ステップ 3",
+            text="固定項目: 測定No列 A / 測定行(min) 11 / 測定行ステップ 3 / 集計行(min) 11 / 集計行(max) は測定行(max) と連動 / 集計行ステップ 3 / 数式区切り , / 工具名列 E / 工具行ステップ 3",
         ).pack(anchor="w", pady=(6, 3))
 
         ttk.Label(basic, text="出力列: L～SR（固定）").pack(anchor="w", pady=3)
@@ -1392,7 +1417,7 @@ class ConfigEditor(tb.Window):
                 "measure_row_max": int(self.vars["measure_row_max"].get()),
                 "measure_row_step": LOCKED_BASIC_SETTINGS["measure_row_step"],
                 "summary_row_min": LOCKED_BASIC_SETTINGS["summary_row_min"],
-                "summary_row_max": int(self.vars["summary_row_max"].get()),
+                "summary_row_max": int(self.vars["measure_row_max"].get()),
                 "summary_row_step": LOCKED_BASIC_SETTINGS["summary_row_step"],
                 "formula_arg_sep": LOCKED_BASIC_SETTINGS["formula_arg_sep"],
                 "tool_start_row": int(self.vars["tool_start_row"].get()),
@@ -1593,8 +1618,8 @@ class ConfigEditor(tb.Window):
         usage_text = """
     【基本設定】
     1. 先に「Excelを選択」で元ファイルを読み込み、プレビューで対象シートを確認します
-    2. シート名・測定行(max)・集計行(max)・工具開始行を必要に応じて調整します
-    3. 次の項目は固定で変更できません: 測定No列 A / 測定行(min) 11 / 測定行ステップ 3 / 集計行(min) 11 / 集計行ステップ 3 / 数式区切り , / 工具名列 E / 工具行ステップ 3
+    2. シート名・測定行(max)・工具開始行を必要に応じて調整します
+    3. 次の項目は固定で変更できません: 測定No列 A / 測定行(min) 11 / 測定行ステップ 3 / 集計行(min) 11 / 集計行(max) は測定行(max) と連動 / 集計行ステップ 3 / 数式区切り , / 工具名列 E / 工具行ステップ 3
     4. 出力列は L～SR 固定です
 
     【先頭集計式の注意】
