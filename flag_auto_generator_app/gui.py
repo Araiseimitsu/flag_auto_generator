@@ -3,9 +3,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import ttkbootstrap as tb
+from ttkbootstrap.constants import INFO, SECONDARY
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
 
+from .help_dialog import open_help_window
 from .excel_ops import (
     AUTO_DATA_MAX_ITEMS,
     LOCKED_BASIC_SETTINGS,
@@ -19,16 +21,32 @@ from .excel_ops import (
     write_measurement_not_required,
 )
 from .ui_helpers import LoadingDialog, pick_save_path
+from .ui_theme import (
+    HINT_WRAPLENGTH,
+    THEME_NAME,
+    apply_app_style,
+    apply_preview_treeview_style,
+    font_ui,
+    make_step_caption,
+    place_toplevel_center,
+    scrollstrip_background,
+    section_separator,
+)
 
 
 class ConfigEditor(tb.Window):
     def __init__(self):
-        super().__init__(themename="darkly")
-        self.title("検査シート 設定作成")
-        self.geometry("820x640")
+        super().__init__(themename=THEME_NAME)
+        self.title("検査シート 設定ツール")
+        self.geometry("920x780")
+        self.minsize(780, 600)
         try:
             self.state("zoomed")
         except Exception:
+            pass
+        try:
+            apply_app_style(self)
+        except (tk.TclError, AttributeError):
             pass
 
         measure_row_min_default = LOCKED_BASIC_SETTINGS["measure_row_min"]
@@ -57,9 +75,9 @@ class ConfigEditor(tb.Window):
             "tool_name_col": tk.StringVar(value=LOCKED_BASIC_SETTINGS["tool_name_col"]),
             "tool_row_step": tk.IntVar(value=tool_row_step_default),
             "not_required_row": tk.StringVar(value=str(not_required_row_default)),
-            "not_required_nos": tk.StringVar(value=""),
         }
 
+        self.not_required_no_input_var = tk.StringVar(value="")
         self.auto_map_measure_no_var = tk.StringVar(value="")
         self.auto_map_data_index_var = tk.StringVar(value="")
 
@@ -67,30 +85,44 @@ class ConfigEditor(tb.Window):
         self._apply_locked_basic_settings()
 
         self.selected_xlsx = tk.StringVar(value="")
-        self.preview_title = tk.StringVar(value="プレビュー (未読み込み)")
+        self.preview_title = tk.StringVar(value="まだ表を表示していません")
 
         self._build_ui()
 
     def _build_ui(self):
-        header_frame = ttk.Frame(self)
-        header_frame.pack(fill="x", padx=10, pady=(10, 0))
-        ttk.Button(header_frame, text="ヘルプ", command=self._show_help).pack(side="right")
+        app_bar = ttk.Frame(self, style="Toolbar.TFrame", padding=(28, 22, 28, 14))
+        app_bar.pack(fill=tk.X)
+        left = ttk.Frame(app_bar, style="Toolbar.TFrame")
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(left, text="FLAG AUTO GENERATOR", style="HeroEyebrow.TLabel").pack(anchor="w")
+        ttk.Label(left, text="検査シート 設定", style="HeroTitle.TLabel").pack(anchor="w", pady=(4, 0))
+        tb.Button(
+            app_bar,
+            text="使い方と注意",
+            command=self._show_help,
+            bootstyle="outline-secondary",
+        ).pack(side=tk.RIGHT, pady=(4, 0))
 
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        body = ttk.Frame(self, style="Toolbar.TFrame")
+        body.pack(fill=tk.BOTH, expand=True, padx=0, pady=(0, 8))
 
-        self.main_canvas = tk.Canvas(body, highlightthickness=0, bd=0)
+        scroll_bg = scrollstrip_background()
+        self.main_canvas = tk.Canvas(
+            body,
+            highlightthickness=0,
+            bd=0,
+            background=scroll_bg,
+        )
         self.main_scrollbar = ttk.Scrollbar(
             body,
             orient="vertical",
             command=self.main_canvas.yview,
         )
         self.main_canvas.configure(yscrollcommand=self.main_scrollbar.set)
+        self.main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.main_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.main_canvas.pack(side="left", fill="both", expand=True)
-        self.main_scrollbar.pack(side="right", fill="y")
-
-        main = ttk.Frame(self.main_canvas, padding=10)
+        main = ttk.Frame(self.main_canvas, style="Toolbar.TFrame", padding=(28, 10, 28, 36))
         self.main_canvas_window = self.main_canvas.create_window(
             (0, 0),
             window=main,
@@ -109,146 +141,288 @@ class ConfigEditor(tb.Window):
         self.bind_all("<Button-4>", self._on_main_mousewheel, add="+")
         self.bind_all("<Button-5>", self._on_main_mousewheel, add="+")
 
-        source_frame = ttk.LabelFrame(main, text="元Excelとプレビュー", padding=10)
-        source_frame.pack(fill="both", expand=True)
+        make_step_caption(
+            main,
+            1,
+            "元の Excel を指定する",
+            "会社の雛形ファイル（.xlsx）を選び、下の表で中身の一部を確認します。",
+        )
+        source_frame = ttk.LabelFrame(
+            main,
+            text="ファイルと取り込み内容のイメージ",
+            style="AppCard.TLabelframe",
+            padding=14,
+        )
+        source_frame.pack(fill=tk.BOTH, expand=True)
 
-        src_row = ttk.Frame(source_frame)
-        src_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(src_row, text="元Excelファイル").pack(side="left")
-        ttk.Entry(src_row, textvariable=self.selected_xlsx, width=60, state="readonly").pack(side="left", padx=6)
-        ttk.Button(src_row, text="Excelを選択", command=self._load_preview).pack(side="left")
-        ttk.Button(src_row, text="プレビュー更新", command=self._render_preview).pack(side="left", padx=6)
-        ttk.Label(src_row, textvariable=self.preview_title).pack(side="right")
+        src_file = ttk.Frame(source_frame, style="Surface.TFrame")
+        src_file.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(src_file, text="参照中のファイル", style="CardTitle.TLabel").pack(anchor=tk.W)
+        path_row = ttk.Frame(source_frame, style="Surface.TFrame")
+        path_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Entry(
+            path_row,
+            textvariable=self.selected_xlsx,
+            state="readonly",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        tb.Button(path_row, text="参照…", command=self._load_preview, bootstyle=SECONDARY).pack(
+            side=tk.LEFT
+        )
+        tb.Button(
+            path_row,
+            text="表を再表示",
+            command=self._render_preview,
+            bootstyle="outline-secondary",
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
-        preview_container = ttk.Frame(source_frame)
-        preview_container.pack(fill="both", expand=True)
+        ttk.Label(
+            source_frame,
+            textvariable=self.preview_title,
+            style="CardNote.TLabel",
+        ).pack(anchor="w", pady=(0, 6))
+
+        preview_container = ttk.Frame(source_frame, style="Surface.TFrame")
+        preview_container.pack(fill=tk.BOTH, expand=True)
         self.preview_columns = ("A", "B", "G", "K")
 
-        style = ttk.Style(self)
-        style.configure(
-            "Preview.Treeview",
-            rowheight=22,
-            borderwidth=1,
-            relief="solid",
-            bordercolor="#ffffff",
-            lightcolor="#ffffff",
-            darkcolor="#ffffff",
-        )
-        style.configure(
-            "Preview.Treeview.Heading",
-            borderwidth=1,
-            relief="solid",
-            anchor="center",
-        )
+        apply_preview_treeview_style(self)
+        ttk.Style(self).configure("Preview.Treeview.Heading", anchor="center")
 
         self.preview_tree = ttk.Treeview(
             preview_container,
             columns=self.preview_columns,
             show="headings",
-            height=8,
+            height=9,
             style="Preview.Treeview",
         )
         vsb = ttk.Scrollbar(preview_container, orient="vertical", command=self.preview_tree.yview)
         self.preview_tree.configure(yscrollcommand=vsb.set)
-        self.preview_tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="left", fill="y")
+        self.preview_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        basic = ttk.LabelFrame(main, text="基本設定", padding=10)
-        basic.pack(fill="x", pady=(10, 0))
+        section_separator(main)
 
-        basic_inner = ttk.Frame(basic)
-        basic_inner.pack(fill="x")
+        make_step_caption(
+            main,
+            2,
+            "基本のシート名と「測定不要」の行",
+            "いつも使うシート名に合わせます。E 列の「測定不要」が入る行を指定します。",
+        )
+        basic = ttk.LabelFrame(main, text="基本・測定不要", padding=14)
+        basic.configure(style="AppCard.TLabelframe")
+        basic.pack(fill=tk.X)
+
+        basic_inner = ttk.Frame(basic, style="Surface.TFrame")
+        basic_inner.pack(fill=tk.X)
         basic_inner.columnconfigure(0, weight=1)
         basic_inner.columnconfigure(1, weight=1)
 
-        basic_left = ttk.Frame(basic_inner)
-        basic_left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        basic_right = ttk.LabelFrame(basic_inner, text="測定不要書き込み設定", padding=10)
-        basic_right.grid(row=0, column=1, sticky="nsew")
-
-        def add_field(parent, row, label, key, width=12, editable=True):
-            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
-            if editable:
-                ttk.Entry(parent, textvariable=self.vars[key], width=width).grid(row=row, column=1, sticky="w", padx=(0, 20), pady=3)
-                return
-            ttk.Label(
-                parent,
-                text=str(self.vars[key].get()),
-                width=width,
-            ).grid(row=row, column=1, sticky="w", padx=(0, 20), pady=3)
-
-        add_field(basic_left, 0, "シート名", "sheet_name", width=25)
-        ttk.Label(basic_right, text="測定不要書き込み設定の行:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+        basic_left = ttk.LabelFrame(
+            basic_inner,
+            text="シート名",
+            style="AppCard.TLabelframe",
+            padding=10,
+        )
+        basic_left.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 10))
+        ttk.Label(basic_left, text="加工・検査で開くシートの名前", style="CardNote.TLabel").pack(
+            anchor=tk.W
+        )
         ttk.Entry(
-            basic_right,
-            textvariable=self.vars["not_required_row"],
-            width=15,
-        ).grid(row=0, column=1, sticky="w", padx=(0, 30), pady=5)
+            basic_left,
+            textvariable=self.vars["sheet_name"],
+            width=28,
+        ).pack(anchor=tk.W, pady=(6, 0))
+
+        basic_right = ttk.LabelFrame(
+            basic_inner,
+            text="測定不要の書き込み（任意）",
+            style="AppCard.TLabelframe",
+            padding=10,
+        )
+        basic_right.grid(row=0, column=1, sticky=tk.NSEW)
         ttk.Label(
             basic_right,
-            text="L～SR列に'-'を入れるNo.(カンマ区切り):",
-        ).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
-        ttk.Entry(basic_right, textvariable=self.vars["not_required_nos"], width=40).grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=5)
-        basic_right.columnconfigure(1, weight=1)
+            text="L～SR で「-」にしたい測定 No（1件ずつ登録）",
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
 
-        tools_frame = ttk.LabelFrame(main, text="工具と測定No対応", padding=10)
-        tools_frame.pack(fill="both", expand=True, pady=(10, 0))
-        self.tools_tree = ttk.Treeview(tools_frame, columns=("tool", "nos"), show="headings", height=12)
+        not_req_row = ttk.Frame(basic_right, style="Surface.TFrame")
+        not_req_row.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 6))
+        ttk.Label(not_req_row, text="測定 No").pack(side=tk.LEFT)
+        ttk.Entry(
+            not_req_row,
+            textvariable=self.not_required_no_input_var,
+            width=10,
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        tb.Button(
+            not_req_row,
+            text="追加",
+            command=self._add_not_required_no,
+            bootstyle=SECONDARY,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        tb.Button(
+            not_req_row,
+            text="選択を削除",
+            command=self._delete_selected_not_required_no,
+            bootstyle="outline-secondary",
+        ).pack(side=tk.LEFT)
+
+        nr_list_frame = ttk.Frame(basic_right, style="Surface.TFrame")
+        nr_list_frame.grid(row=2, column=0, columnspan=2, sticky=tk.NSEW, pady=(0, 4))
+        self.not_required_nos_tree = ttk.Treeview(
+            nr_list_frame,
+            columns=("no",),
+            show="headings",
+            height=5,
+            style="Data.Treeview",
+        )
+        self.not_required_nos_tree.heading("no", text="登録した測定 No")
+        self.not_required_nos_tree.column("no", width=140, anchor=tk.CENTER)
+        nr_sb = ttk.Scrollbar(
+            nr_list_frame,
+            orient=tk.VERTICAL,
+            command=self.not_required_nos_tree.yview,
+        )
+        self.not_required_nos_tree.configure(yscrollcommand=nr_sb.set)
+        self.not_required_nos_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        nr_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        basic_right.columnconfigure(0, weight=1)
+        section_separator(main)
+
+        make_step_caption(
+            main,
+            3,
+            "工具名と、どの測定番号に当てるか",
+            "工具名と、その工具が扱う測定 No を一覧で入れます。行を選ぶと「編集」「削除」ができます。",
+        )
+        tools_frame = ttk.LabelFrame(
+            main,
+            text="工具の一覧",
+            style="AppCard.TLabelframe",
+            padding=10,
+        )
+        tools_frame.pack(fill=tk.BOTH, expand=True)
+        self.tools_tree = ttk.Treeview(
+            tools_frame,
+            columns=("tool", "nos"),
+            show="headings",
+            height=11,
+            style="Data.Treeview",
+        )
         self.tools_tree.heading("tool", text="工具名")
-        self.tools_tree.heading("nos", text="測定No(カンマ区切り)")
-        self.tools_tree.column("tool", width=220, anchor="w")
-        self.tools_tree.column("nos", width=420, anchor="w")
-        self.tools_tree.pack(side="left", fill="both", expand=True)
+        self.tools_tree.heading("nos", text="測定 No（半角数字・カンマ区切り）")
+        self.tools_tree.column("tool", width=220, anchor=tk.W)
+        self.tools_tree.column("nos", width=450, anchor=tk.W)
+        self.tools_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar = ttk.Scrollbar(tools_frame, orient="vertical", command=self.tools_tree.yview)
         self.tools_tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        tools_btns = ttk.Frame(main)
-        tools_btns.pack(fill="x", pady=(6, 0))
-        ttk.Button(tools_btns, text="工具追加", command=self._add_tool_dialog).pack(side="left")
-        ttk.Button(tools_btns, text="選択編集", command=self._edit_selected_tool).pack(side="left", padx=5)
-        ttk.Button(tools_btns, text="選択削除", command=self._delete_selected_tool).pack(side="left")
+        tools_btns = ttk.Frame(main, style="Toolbar.TFrame")
+        tools_btns.pack(fill=tk.X, pady=(8, 0))
+        tb.Button(
+            tools_btns,
+            text="＋ 追加",
+            command=self._add_tool_dialog,
+            bootstyle=SECONDARY,
+        ).pack(side=tk.LEFT)
+        tb.Button(
+            tools_btns,
+            text="編集",
+            command=self._edit_selected_tool,
+            bootstyle="outline-secondary",
+        ).pack(side=tk.LEFT, padx=6)
+        tb.Button(
+            tools_btns,
+            text="削除",
+            command=self._delete_selected_tool,
+            bootstyle="outline-secondary",
+        ).pack(side=tk.LEFT)
 
-        auto_map_frame = ttk.LabelFrame(main, text="自動測定データ対応（測定No → データ順番）", padding=10)
-        auto_map_frame.pack(fill="both", expand=True, pady=(10, 0))
+        section_separator(main)
 
-        auto_input = ttk.Frame(auto_map_frame)
-        auto_input.pack(fill="x", pady=(0, 8))
-        ttk.Label(auto_input, text="測定No").pack(side="left")
-        ttk.Entry(auto_input, textvariable=self.auto_map_measure_no_var, width=12).pack(
-            side="left", padx=(6, 12)
+        make_step_caption(
+            main,
+            4,
+            "自動測定のデータと測定番号の対応",
+            f"測定 No ごとに、自動測定ブロック内の何番目の値を参照するか（1〜{AUTO_DATA_MAX_ITEMS}）を入れます。",
         )
-        ttk.Label(auto_input, text=f"データ順番 (1〜{AUTO_DATA_MAX_ITEMS})").pack(side="left")
-        ttk.Entry(auto_input, textvariable=self.auto_map_data_index_var, width=12).pack(
-            side="left", padx=(6, 12)
+        auto_map_frame = ttk.LabelFrame(
+            main,
+            text="対応表",
+            style="AppCard.TLabelframe",
+            padding=10,
         )
-        ttk.Button(auto_input, text="追加", command=self._add_auto_map).pack(side="left")
-        ttk.Button(auto_input, text="選択削除", command=self._delete_selected_auto_map).pack(
-            side="left", padx=6
-        )
+        auto_map_frame.pack(fill=tk.BOTH, expand=True)
+
+        auto_input = ttk.Frame(auto_map_frame, style="Surface.TFrame")
+        auto_input.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(auto_input, text="測定 No").pack(side=tk.LEFT)
+        ttk.Entry(
+            auto_input,
+            textvariable=self.auto_map_measure_no_var,
+            width=10,
+        ).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(auto_input, text=f"データの順番（1〜{AUTO_DATA_MAX_ITEMS}）").pack(side=tk.LEFT)
+        ttk.Entry(
+            auto_input,
+            textvariable=self.auto_map_data_index_var,
+            width=8,
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        tb.Button(
+            auto_input,
+            text="追加 / 上書き",
+            command=self._add_auto_map,
+            bootstyle=SECONDARY,
+        ).pack(side=tk.LEFT)
+        tb.Button(
+            auto_input,
+            text="選択を削除",
+            command=self._delete_selected_auto_map,
+            bootstyle="outline-secondary",
+        ).pack(side=tk.LEFT, padx=6)
 
         self.auto_map_tree = ttk.Treeview(
             auto_map_frame,
             columns=("measure_no", "data_index"),
             show="headings",
             height=6,
+            style="Data.Treeview",
         )
-        self.auto_map_tree.heading("measure_no", text="測定No")
-        self.auto_map_tree.heading("data_index", text="データ順番")
-        self.auto_map_tree.column("measure_no", width=200, anchor="w")
-        self.auto_map_tree.column("data_index", width=140, anchor="center")
-        self.auto_map_tree.pack(side="left", fill="both", expand=True)
+        self.auto_map_tree.heading("measure_no", text="測定 No")
+        self.auto_map_tree.heading("data_index", text="データの順番")
+        self.auto_map_tree.column("measure_no", width=200, anchor=tk.W)
+        self.auto_map_tree.column("data_index", width=120, anchor=tk.CENTER)
+        self.auto_map_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         auto_scrollbar = ttk.Scrollbar(
             auto_map_frame,
             orient="vertical",
             command=self.auto_map_tree.yview,
         )
         self.auto_map_tree.configure(yscrollcommand=auto_scrollbar.set)
-        auto_scrollbar.pack(side="right", fill="y")
+        auto_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        btns = ttk.Frame(main)
-        btns.pack(fill="x", pady=(10, 0))
-        ttk.Button(btns, text="この設定でExcel生成", command=self._run_build).pack(side="right")
+        action_bar = ttk.LabelFrame(
+            main,
+            text="実行",
+            style="AppCard.TLabelframe",
+            padding=(14, 14, 14, 14),
+        )
+        action_bar.pack(fill=tk.X)
+        lower = ttk.Frame(action_bar, style="Surface.TFrame")
+        lower.pack(fill=tk.X)
+        ttk.Label(
+            lower,
+            text="元の Excel・保存先のファイルは、必ず保存して閉じてから実行してください。",
+            style="CardNote.TLabel",
+            wraplength=480,
+            justify=tk.LEFT,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tb.Button(
+            lower,
+            text="　この内容で Excel を保存・生成　",
+            command=self._run_build,
+            bootstyle=INFO,
+        ).pack(side=tk.RIGHT)
 
         if not self.tools_tree.get_children():
             self._insert_tool("前挽き(サンプル)", "1, 5, 10")
@@ -472,22 +646,35 @@ class ConfigEditor(tb.Window):
         self.tools_tree.insert("", "end", values=(tool_name, nos_text))
 
     def _tool_dialog(self, title, init_tool="", init_nos=""):
-        win = tk.Toplevel(self)
+        win = tb.Toplevel(self)
         win.title(title)
         win.transient(self)
         win.grab_set()
+        try:
+            win.configure(bg=self["bg"])
+        except tk.TclError:
+            pass
 
         tool_var = tk.StringVar(value=init_tool)
         nos_var = tk.StringVar(value=init_nos)
 
-        frm = ttk.Frame(win, padding=10)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="工具名").grid(row=0, column=0, sticky="w", pady=4)
-        tool_entry = ttk.Entry(frm, textvariable=tool_var, width=30)
-        tool_entry.grid(row=0, column=1, sticky="w", pady=4)
+        frm = ttk.Frame(win, style="Surface.TFrame", padding=22)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="工具名", style="CardTitle.TLabel").grid(row=0, column=0, sticky=tk.W, pady=4)
+        tool_entry = ttk.Entry(frm, textvariable=tool_var, width=36)
+        tool_entry.grid(row=0, column=1, sticky=tk.EW, pady=4, padx=(8, 0))
 
-        ttk.Label(frm, text="測定No(カンマ区切り)").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(frm, textvariable=nos_var, width=40).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(frm, text="測定 No", style="CardTitle.TLabel").grid(row=1, column=0, sticky=tk.NW, pady=10)
+        nos_box = ttk.Frame(frm, style="Surface.TFrame")
+        nos_box.grid(row=1, column=1, sticky=tk.EW, pady=10, padx=(8, 0))
+        ttk.Entry(nos_box, textvariable=nos_var, width=36).pack(anchor=tk.W)
+        ttk.Label(
+            nos_box,
+            text="半角の整数をカンマで区切ります。例: 1, 5, 10",
+            style="CardNote.TLabel",
+            wraplength=320,
+        ).pack(anchor=tk.W, pady=(4, 0))
+        frm.columnconfigure(1, weight=1)
 
         result = {"ok": False}
 
@@ -501,7 +688,7 @@ class ConfigEditor(tb.Window):
             except Exception:
                 messagebox.showwarning(
                     "入力エラー",
-                    "測定Noは整数のカンマ区切りで入力してください。",
+                    "測定 No は、整数をカンマ区切りで入力してください。",
                     parent=win,
                 )
                 return
@@ -513,12 +700,18 @@ class ConfigEditor(tb.Window):
         def on_cancel():
             win.destroy()
 
-        bfrm = ttk.Frame(frm)
-        bfrm.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
-        ttk.Button(bfrm, text="OK", command=on_ok).pack(side="right")
-        ttk.Button(bfrm, text="キャンセル", command=on_cancel).pack(side="right", padx=5)
+        bfrm = ttk.Frame(frm, style="Surface.TFrame")
+        bfrm.grid(row=2, column=0, columnspan=2, sticky=tk.E, pady=(20, 0))
+        tb.Button(bfrm, text="キャンセル", command=on_cancel, bootstyle="outline-secondary").pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        tb.Button(bfrm, text="登録", command=on_ok, bootstyle=INFO).pack(side=tk.RIGHT)
 
         tool_entry.focus_set()
+        win.update_idletasks()
+        _tw, _th = 580, 300
+        win.minsize(_tw, _th)
+        place_toplevel_center(win, _tw, _th)
         self.wait_window(win)
         return result
 
@@ -587,6 +780,54 @@ class ConfigEditor(tb.Window):
             return
         for item in selected:
             self.auto_map_tree.delete(item)
+
+    def _collect_not_required_nos(self) -> list[int]:
+        nums: list[int] = []
+        for item in self.not_required_nos_tree.get_children():
+            try:
+                n = int(self.not_required_nos_tree.item(item, "values")[0])
+            except (TypeError, ValueError, IndexError, tk.TclError):
+                continue
+            nums.append(n)
+        return sorted(set(nums))
+
+    def _add_not_required_no(self):
+        raw = self.not_required_no_input_var.get().strip()
+        n = _try_extract_int(raw)
+        if n is None:
+            messagebox.showwarning("入力エラー", "測定 No を整数で入力してください。", parent=self)
+            return
+        for item in self.not_required_nos_tree.get_children():
+            try:
+                v = int(self.not_required_nos_tree.item(item, "values")[0])
+            except (TypeError, ValueError, IndexError, tk.TclError):
+                continue
+            if v == n:
+                messagebox.showinfo("重複", "この No はすでに登録されています。", parent=self)
+                return
+        self.not_required_nos_tree.insert("", "end", values=(str(n),))
+        self._sort_not_required_nos_tree()
+        self.not_required_no_input_var.set("")
+
+    def _sort_not_required_nos_tree(self):
+        values: list[int] = []
+        for item in self.not_required_nos_tree.get_children():
+            try:
+                values.append(int(self.not_required_nos_tree.item(item, "values")[0]))
+            except (TypeError, ValueError, IndexError, tk.TclError):
+                continue
+        for item in self.not_required_nos_tree.get_children():
+            self.not_required_nos_tree.delete(item)
+        for n in sorted(set(values)):
+            self.not_required_nos_tree.insert("", "end", values=(str(n),))
+
+    def _delete_selected_not_required_no(self):
+        selected = self.not_required_nos_tree.selection()
+        if not selected:
+            messagebox.showinfo("選択なし", "削除する行を選んでください。", parent=self)
+            return
+        for item in selected:
+            self.not_required_nos_tree.delete(item)
 
     def _gather_cfg(self):
         try:
@@ -662,7 +903,7 @@ class ConfigEditor(tb.Window):
         if not xlsx:
             messagebox.showinfo(
                 "ファイル未選択",
-                "先に「Excelを選択」で元ファイルを読み込んでください。",
+                "先に「参照…」で元の Excel を選んでください。",
                 parent=self,
             )
             self._load_preview()
@@ -687,19 +928,17 @@ class ConfigEditor(tb.Window):
                 saved_path = build_request_formulas(xlsx, out_path, cfg, parent=self)
                 result["saved_path"] = saved_path
 
-                not_required_nos_text = self.vars["not_required_nos"].get().strip()
-                if not_required_nos_text:
+                target_nos = self._collect_not_required_nos()
+                if target_nos:
                     try:
-                        target_nos = _parse_int_list(not_required_nos_text)
-                        if target_nos:
-                            saved_path = write_measurement_not_required(
-                                saved_path,
-                                out_path,
-                                cfg,
-                                target_nos=target_nos,
-                                parent=self,
-                            )
-                            result["saved_path"] = saved_path
+                        saved_path = write_measurement_not_required(
+                            saved_path,
+                            out_path,
+                            cfg,
+                            target_nos=target_nos,
+                            parent=self,
+                        )
+                        result["saved_path"] = saved_path
                     except Exception as e:
                         result["error"] = f"測定不要書き込みでエラーが発生しました:\n{e}"
                         result["success"] = True
@@ -738,16 +977,11 @@ class ConfigEditor(tb.Window):
             messagebox.showerror("失敗", str(e), parent=self)
             return
 
-        try:
-            target_nos = _parse_int_list(self.vars["not_required_nos"].get())
-        except Exception as e:
-            messagebox.showerror("入力エラー", f"測定Noの入力が不正です。\n{e}", parent=self)
-            return
-
+        target_nos = self._collect_not_required_nos()
         if not target_nos:
             messagebox.showwarning(
                 "入力不足",
-                "L～SR列に'-'を入れるNo.を入力してください。",
+                "L～SR で「-」にする測定 No を1件以上登録してください。",
                 parent=self,
             )
             return
@@ -756,7 +990,7 @@ class ConfigEditor(tb.Window):
         if not xlsx:
             messagebox.showinfo(
                 "ファイル未選択",
-                "先に「Excelを選択」で元ファイルを読み込んでください。",
+                "先に「参照…」で元の Excel を選んでください。",
                 parent=self,
             )
             self._load_preview()
@@ -786,132 +1020,7 @@ class ConfigEditor(tb.Window):
         messagebox.showinfo("完了", f"書き込み完了:\n{saved_path}", parent=self)
 
     def _show_help(self):
-        help_window = tk.Toplevel(self)
-        help_window.title("使い方")
-        help_window.transient(self)
-        help_window.grab_set()
-        help_window.geometry("600x500")
-
-        canvas = tk.Canvas(help_window, highlightthickness=0, bd=0)
-        scrollbar = ttk.Scrollbar(help_window, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        content_frame = ttk.Frame(scrollable_frame, padding=20)
-        content_frame.pack(fill="both", expand=True)
-
-        version_frame = ttk.LabelFrame(content_frame, text="バージョン情報", padding=10)
-        version_frame.pack(fill="x", pady=(0, 15))
-
-        ttk.Label(version_frame, text="Version: 0.7.0", font=("", 10, "bold")).pack(anchor="w")
-        ttk.Label(version_frame, text="Latest: 2026-02-26", font=("", 10)).pack(anchor="w", pady=(5, 0))
-        ttk.Label(version_frame, text="created by DIP Dpertment/A・T", font=("", 10)).pack(anchor="w", pady=(5, 0))
-
-        usage_frame = ttk.LabelFrame(content_frame, text="使い方", padding=10)
-        usage_frame.pack(fill="both", expand=True)
-
-        usage_text = """
-    【基本設定】
-    1. 先に「Excelを選択」で元ファイルを読み込み、プレビューで対象シートを確認します
-    2. 基本設定では「シート名」だけを必要に応じて調整します
-    3. 測定不要書き込み設定の行を入力すると、測定行(max) はその1つ上、工具開始行はその3つ下として内部で自動計算します
-    4. 自動測定データ開始行は「測定不要書き込み設定の行 + (工具数 × 3) + 6」で内部自動計算します
-    5. 出力列は L～SR 固定です
-
-    【先頭集計式の注意】
-    1. 1行目の基準式は =SUMPRODUCT(--(L11:L308<>""),--(MOD(ROW(L11:L308)-ROW(L11),2)=0)) です
-    2. 1行目がこの形式でない場合は、L〜SN列の1〜3行目に同パターンの式を補正投入します
-    3. 2行目・3行目は1行目を貼り付けた相対参照と同じ内容で設定します
-
-    【工具と測定No対応】
-    1. 「工具追加」で工具名と測定No（カンマ区切り）を登録します
-    2. 工具行の同じ列に値が入った場合、10行目も「依頼」になります
-    3. 登録した測定Noの行に、列ごとに「依頼」判定式が設定されます
-    4. 同じ測定Noが自動測定データ対応にもある場合は、自動測定結果参照を優先し、参照結果が空のときだけ「依頼」を表示します
-
-    【注意】
-    1. 生成したファイルを開くと「作成されたファイルを修正しますか？」と表示される場合があります
-    2. その場合は「はい」を押して進めてください
-    3. 書式やレイアウトが変わっている場合は、必要な関数のみを既存のExcelへ貼り付けて使用してください
-
-    【自動測定結果の反映】
-    1. 自動測定データ開始行は「測定不要書き込み設定の行 + (工具数 × 3) + 6」で自動計算します
-    2. 「測定No → データ順番」を追加すると、対応する測定行のL～SRに自動測定結果参照式を設定します
-    3. データ順番が1なら開始行、2なら開始行+1…を同じ列で参照します
-
-    【測定不要書き込み設定（任意）】
-    1. 「測定不要書き込み設定の行」には、E列へ「測定不要」を書き込む行番号を入力します
-    2. No.欄に測定Noを入れると、生成後に追加処理として測定不要式を設定します
-    3. 指定Noの行のL～SRでは、自動測定結果参照と「依頼」を優先し、どちらも空のときだけ同列の「測定不要」入力に応じて「-」を表示します
-
-    【Excel生成の処理順】
-    1. 「この設定でExcel生成」を押して出力先を指定します
-    2. 依頼式・自動測定参照式を書き込みます
-    3. 測定不要Noが指定されている場合は続けて測定不要式を書き込みます
-    4. 最後に再計算・保存して完了します
-        """
-
-        usage_label = ttk.Label(
-            usage_frame,
-            text=usage_text.strip(),
-            justify="left",
-            font=("", 9),
-        )
-        usage_label.pack(anchor="w", padx=5)
-
-        note_frame = ttk.LabelFrame(content_frame, text="注意事項", padding=10)
-        note_frame.pack(fill="x", pady=(15, 0))
-
-        note_text = """
-    • 元Excel・出力先Excelは閉じた状態で実行してください（保存失敗の原因になります）
-    • 測定Noは整数で指定してください（例: 1,5,10）
-    • シート名や測定行範囲が実ファイルと異なると対象行を特定できません
-    • 自動測定結果参照の式を使うため、元シートの該当列データ位置を事前に確認してください
-        """
-
-        note_label = ttk.Label(
-            note_frame,
-            text=note_text.strip(),
-            justify="left",
-            font=("", 9),
-            foreground="firebrick",
-        )
-        note_label.pack(anchor="w", padx=5)
-
-        btn_frame = ttk.Frame(content_frame)
-        btn_frame.pack(fill="x", pady=(15, 0))
-        ttk.Button(btn_frame, text="閉じる", command=help_window.destroy).pack(side="right")
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        def _on_mousewheel(event):
-            if event.delta:
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                return
-            if event.num == 4:
-                canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                canvas.yview_scroll(1, "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        canvas.bind_all("<Button-4>", _on_mousewheel)
-        canvas.bind_all("<Button-5>", _on_mousewheel)
-
-        def update_scroll_region(event=None):
-            canvas.update_idletasks()
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def configure_canvas_width(event):
-            canvas_width = event.width
-            canvas.itemconfig(canvas.find_all()[0], width=canvas_width)
-
-        scrollable_frame.bind("<Configure>", update_scroll_region)
-        canvas.bind("<Configure>", configure_canvas_width)
-
-        help_window.focus_set()
+        open_help_window(self)
 
 
 def main():

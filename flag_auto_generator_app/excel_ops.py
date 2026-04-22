@@ -1,7 +1,11 @@
+import copy
 import os
+import posixpath
 import re
+import tempfile
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
@@ -10,16 +14,19 @@ from openpyxl.worksheet.formula import ArrayFormula
 from tkinter import messagebox
 
 
-AUTO_DATA_START_ROW_DEFAULT = 230
-NOT_REQUIRED_ROW_DEFAULT = 197
+# 測定不要行デフォルト 122。配下の自動データ開始行フォールバックは 1 工具想定: 122 + 3 + 6
+AUTO_DATA_START_ROW_DEFAULT = 131
+NOT_REQUIRED_ROW_DEFAULT = 122
 AUTO_DATA_MAX_ITEMS = 100
 REQUEST_HEADER_ROW = 10
 SUMMARY_FORMULA_COL_START = "L"
 SUMMARY_FORMULA_COL_END = "SN"
 REQUEST_OUTPUT_COL_START = "L"
 REQUEST_OUTPUT_COL_END = "SR"
-SUMMARY_FORMULA_BASE_START_ROW = 9
-SUMMARY_FORMULA_BASE_END_ROW = 308
+# 1〜3 行目の SUMPRODUCT: 行ごとに開始/終了が 1 行ずつずれる（L11:L119 / L12:L120 / L13:L121）
+SUMMARY_FORMULA_BASE_START_ROW = 11
+SUMMARY_FORMULA_BASE_END_ROW = 119
+SUMMARY_FORMULA_MOD_DIVISOR = 3
 LOCKED_BASIC_SETTINGS = {
     "measure_no_col": "A",
     "measure_row_min": 11,
@@ -30,6 +37,40 @@ LOCKED_BASIC_SETTINGS = {
     "tool_name_col": "E",
     "tool_row_step": 3,
 }
+FORCE_EXCEL_RECALC_ENV = "FLAG_AUTO_GENERATOR_FORCE_EXCEL_RECALC"
+MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+X14AC_NS = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"
+XR_NS = "http://schemas.microsoft.com/office/spreadsheetml/2014/revision"
+XR2_NS = "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2"
+XR3_NS = "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3"
+X15_NS = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main"
+X15AC_NS = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac"
+XR6_NS = "http://schemas.microsoft.com/office/spreadsheetml/2016/revision6"
+XR10_NS = "http://schemas.microsoft.com/office/spreadsheetml/2016/revision10"
+XCALCF_NS = "http://schemas.microsoft.com/office/spreadsheetml/2018/calcfeatures"
+NS = {
+    "main": MAIN_NS,
+    "rel": REL_NS,
+    "pkg": PKG_REL_NS,
+    "ct": CONTENT_TYPES_NS,
+}
+
+ET.register_namespace("", MAIN_NS)
+ET.register_namespace("r", REL_NS)
+ET.register_namespace("mc", MC_NS)
+ET.register_namespace("x14ac", X14AC_NS)
+ET.register_namespace("xr", XR_NS)
+ET.register_namespace("xr2", XR2_NS)
+ET.register_namespace("xr3", XR3_NS)
+ET.register_namespace("x15", X15_NS)
+ET.register_namespace("x15ac", X15AC_NS)
+ET.register_namespace("xr6", XR6_NS)
+ET.register_namespace("xr10", XR10_NS)
+ET.register_namespace("xcalcf", XCALCF_NS)
 
 
 def _derive_layout_rows(not_required_row: int, measure_row_min: int) -> tuple[int, int]:
@@ -54,27 +95,26 @@ def _get_writable_cell(ws, row: int, col: int):
     return cell
 
 
-def _save_workbook_atomic(wb, out_path: str, parent=None) -> str:
+def _save_workbook_to_temp_file(wb, out_path_hint: str) -> str:
+    _, ext = os.path.splitext(out_path_hint)
+    ext = ext or ".xlsx"
+    fd, tmp_path = tempfile.mkstemp(suffix=ext)
+    os.close(fd)
+    wb.save(tmp_path)
+    return tmp_path
+
+
+def _replace_file_atomic(temp_path: str, out_path: str, parent=None) -> str:
     out_path = os.path.abspath(out_path)
     out_dir = os.path.dirname(out_path)
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
-    base, ext = os.path.splitext(out_path)
-    ext = ext or ".xlsx"
-    tmp_path = f"{base}.tmp{ext}"
-
     while True:
         try:
-            wb.save(tmp_path)
-            os.replace(tmp_path, out_path)
+            os.replace(temp_path, out_path)
             return out_path
         except PermissionError as e:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
             if parent is None:
                 raise
             retry = messagebox.askretrycancel(
@@ -87,12 +127,6 @@ def _save_workbook_atomic(wb, out_path: str, parent=None) -> str:
             )
             if not retry:
                 raise
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
 
 
 def _mark_workbook_for_full_recalc(wb):
@@ -117,52 +151,271 @@ def _close_workbook_quietly(wb):
     _safe_call(wb.close)
 
 
-def _restore_package_parts_from_source(source_xlsx_path: str, target_xlsx_path: str):
-    prefixes = (
-        "xl/drawings/",
-        "xl/externalLinks/",
-    )
+def _normalize_package_path(target: str) -> str:
+    normalized = (target or "").replace("\\", "/")
+    if normalized.startswith("/"):
+        normalized = normalized[1:]
+    return posixpath.normpath(normalized)
 
-    source_path = os.path.abspath(source_xlsx_path)
-    target_path = os.path.abspath(target_xlsx_path)
-    temp_path = f"{target_path}.pkgfix"
+
+def _worksheet_path_by_name(xlsx_path: str, sheet_name: str) -> str:
+    with zipfile.ZipFile(xlsx_path, "r") as workbook_zip:
+        workbook_root = ET.fromstring(workbook_zip.read("xl/workbook.xml"))
+        workbook_rels_root = ET.fromstring(workbook_zip.read("xl/_rels/workbook.xml.rels"))
+
+    rel_id_to_target = {}
+    for rel in workbook_rels_root.findall("pkg:Relationship", NS):
+        rel_id = rel.attrib.get("Id")
+        target = _normalize_package_path(rel.attrib.get("Target", ""))
+        if rel_id:
+            rel_id_to_target[rel_id] = target
+
+    for sheet in workbook_root.findall("main:sheets/main:sheet", NS):
+        if sheet.attrib.get("name") != sheet_name:
+            continue
+        rel_id = sheet.attrib.get(f"{{{REL_NS}}}id")
+        if not rel_id:
+            break
+        target = rel_id_to_target.get(rel_id, "")
+        if target.startswith("xl/"):
+            return target
+        if target.startswith("worksheets/"):
+            return f"xl/{target}"
+        return f"xl/{target}"
+
+    raise ValueError(f"シート '{sheet_name}' の XML パスを特定できませんでした。")
+
+
+def _cell_ref_sort_key(cell_ref: str) -> tuple[int, int]:
+    match = re.fullmatch(r"([A-Z]+)(\d+)", cell_ref.upper())
+    if not match:
+        return (10**9, 10**9)
+    col_letters, row_text = match.groups()
+    return (int(row_text), column_index_from_string(col_letters))
+
+
+def _find_or_create_row(sheet_data, row_index: int):
+    existing_rows = sheet_data.findall("main:row", NS)
+    for row in existing_rows:
+        if int(row.attrib.get("r", "0")) == row_index:
+            return row
+
+    new_row = ET.Element(f"{{{MAIN_NS}}}row", {"r": str(row_index)})
+    inserted = False
+    for pos, row in enumerate(existing_rows):
+        if int(row.attrib.get("r", "0")) > row_index:
+            sheet_data.insert(pos, new_row)
+            inserted = True
+            break
+    if not inserted:
+        sheet_data.append(new_row)
+    return new_row
+
+
+def _set_row_cell(row_elem, cell_ref: str, new_cell):
+    new_cell_copy = copy.deepcopy(new_cell)
+    existing_cells = row_elem.findall("main:c", NS)
+    for pos, cell in enumerate(existing_cells):
+        current_ref = cell.attrib.get("r", "")
+        if current_ref == cell_ref:
+            row_elem.remove(cell)
+            row_elem.insert(pos, new_cell_copy)
+            return
+        if _cell_ref_sort_key(current_ref) > _cell_ref_sort_key(cell_ref):
+            row_elem.insert(pos, new_cell_copy)
+            return
+    row_elem.append(new_cell_copy)
+
+
+def _merge_sheet_cells(source_xml: bytes, modified_xml: bytes, changed_refs: set[str]) -> bytes:
+    if not changed_refs:
+        return source_xml
+
+    source_root = ET.fromstring(source_xml)
+    modified_root = ET.fromstring(modified_xml)
+    source_sheet_data = source_root.find("main:sheetData", NS)
+    modified_sheet_data = modified_root.find("main:sheetData", NS)
+    if source_sheet_data is None or modified_sheet_data is None:
+        raise ValueError("sheetData の解析に失敗しました。")
+
+    modified_cell_map = {}
+    for row in modified_sheet_data.findall("main:row", NS):
+        for cell in row.findall("main:c", NS):
+            cell_ref = cell.attrib.get("r")
+            if cell_ref:
+                modified_cell_map[cell_ref] = cell
+
+    for cell_ref in sorted(changed_refs, key=_cell_ref_sort_key):
+        modified_cell = modified_cell_map.get(cell_ref)
+        if modified_cell is None:
+            continue
+        row_index = _cell_ref_sort_key(cell_ref)[0]
+        target_row = _find_or_create_row(source_sheet_data, row_index)
+        _set_row_cell(target_row, cell_ref, modified_cell)
+
+    merged_xml = ET.tostring(source_root, encoding="utf-8", xml_declaration=True)
+    return _restore_root_namespace_declarations(merged_xml, source_xml)
+
+
+def _mark_workbook_xml_for_full_recalc(workbook_xml: bytes) -> bytes:
+    root = ET.fromstring(workbook_xml)
+    calc_pr = root.find("main:calcPr", NS)
+    if calc_pr is None:
+        calc_pr = ET.SubElement(root, f"{{{MAIN_NS}}}calcPr")
+    calc_pr.set("calcMode", "auto")
+    calc_pr.set("fullCalcOnLoad", "1")
+    calc_pr.set("forceFullCalc", "1")
+    serialized_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return _restore_root_namespace_declarations(serialized_xml, workbook_xml)
+
+
+def _restore_root_namespace_declarations(serialized_xml: bytes, original_xml: bytes) -> bytes:
+    serialized_text = serialized_xml.decode("utf-8")
+    original_text = original_xml.decode("utf-8", errors="ignore")
+
+    serialized_match = re.search(r"<([A-Za-z0-9_:.-]+)([^>]*)>", serialized_text)
+    original_match = re.search(r"<([A-Za-z0-9_:.-]+)([^>]*)>", original_text)
+    if not serialized_match or not original_match:
+        return serialized_xml
+
+    serialized_root_tag = serialized_match.group(1)
+    serialized_root_attrs = serialized_match.group(2)
+    original_root_attrs = original_match.group(2)
+
+    namespace_decls = re.findall(r'\s(xmlns(?::[A-Za-z0-9_.-]+)?)="([^"]+)"', original_root_attrs)
+    missing_decls = []
+    for attr_name, uri in namespace_decls:
+        decl_pattern = rf'\s{re.escape(attr_name)}="{re.escape(uri)}"'
+        if re.search(decl_pattern, serialized_root_attrs):
+            continue
+        missing_decls.append(f' {attr_name}="{uri}"')
+
+    if not missing_decls:
+        return serialized_xml
+
+    replacement = f"<{serialized_root_tag}{serialized_root_attrs}{''.join(missing_decls)}>"
+    updated_text = (
+        serialized_text[: serialized_match.start()]
+        + replacement
+        + serialized_text[serialized_match.end() :]
+    )
+    return updated_text.encode("utf-8")
+
+
+def _remove_calc_chain_parts(package_files: dict[str, bytes]):
+    package_files.pop("xl/calcChain.xml", None)
+
+    content_types_xml = package_files.get("[Content_Types].xml")
+    if content_types_xml is not None:
+        content_types_root = ET.fromstring(content_types_xml)
+        for override in list(content_types_root.findall("ct:Override", NS)):
+            if override.attrib.get("PartName") == "/xl/calcChain.xml":
+                content_types_root.remove(override)
+        package_files["[Content_Types].xml"] = ET.tostring(
+            content_types_root,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+
+    workbook_rels_xml = package_files.get("xl/_rels/workbook.xml.rels")
+    if workbook_rels_xml is not None:
+        workbook_rels_root = ET.fromstring(workbook_rels_xml)
+        for rel in list(workbook_rels_root.findall("pkg:Relationship", NS)):
+            if rel.attrib.get("Type", "").endswith("/calcChain"):
+                workbook_rels_root.remove(rel)
+        package_files["xl/_rels/workbook.xml.rels"] = ET.tostring(
+            workbook_rels_root,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+
+
+def _save_preserving_package_parts(
+    source_xlsx_path: str,
+    modified_xlsx_path: str,
+    out_path: str,
+    sheet_name: str,
+    changed_refs: set[str],
+    *,
+    parent=None,
+) -> str:
+    source_sheet_path = _worksheet_path_by_name(source_xlsx_path, sheet_name)
+    modified_sheet_path = _worksheet_path_by_name(modified_xlsx_path, sheet_name)
+    out_path = os.path.abspath(out_path)
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    base, ext = os.path.splitext(out_path)
+    ext = ext or ".xlsx"
+    temp_out_path = f"{base}.tmp{ext}"
+
+    with zipfile.ZipFile(source_xlsx_path, "r") as source_zip:
+        package_files = {
+            name: source_zip.read(name)
+            for name in source_zip.namelist()
+        }
+
+    with zipfile.ZipFile(modified_xlsx_path, "r") as modified_zip:
+        merged_sheet_xml = _merge_sheet_cells(
+            package_files[source_sheet_path],
+            modified_zip.read(modified_sheet_path),
+            changed_refs,
+        )
+        package_files["xl/styles.xml"] = modified_zip.read("xl/styles.xml")
+
+    package_files[source_sheet_path] = merged_sheet_xml
+    package_files["xl/workbook.xml"] = _mark_workbook_xml_for_full_recalc(
+        package_files["xl/workbook.xml"]
+    )
+    _remove_calc_chain_parts(package_files)
 
     try:
-        with zipfile.ZipFile(source_path, "r") as src_zip, zipfile.ZipFile(
-            target_path, "r"
-        ) as dst_zip:
-            src_names = set(src_zip.namelist())
-            dst_names = set(dst_zip.namelist())
-            restore_names = {
-                name
-                for name in src_names
-                if any(name.startswith(prefix) for prefix in prefixes)
-            }
-            if not restore_names:
-                return False
+        with zipfile.ZipFile(temp_out_path, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
+            for name, data in package_files.items():
+                out_zip.writestr(name, data)
+        return _replace_file_atomic(temp_out_path, out_path, parent=parent)
+    finally:
+        if os.path.exists(temp_out_path):
+            _safe_call(os.remove, temp_out_path)
 
-            with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
-                for name in dst_zip.namelist():
-                    if any(name.startswith(prefix) for prefix in prefixes):
-                        if name in restore_names:
-                            out_zip.writestr(name, src_zip.read(name))
-                        continue
-                    out_zip.writestr(name, dst_zip.read(name))
 
-                for name in sorted(restore_names):
-                    if name in dst_names:
-                        continue
-                    out_zip.writestr(name, src_zip.read(name))
+def _finalize_modified_workbook(
+    wb,
+    wb_values,
+    *,
+    source_xlsx_path: str,
+    out_path: str,
+    sheet_name: str,
+    changed_refs: set[str],
+    parent=None,
+) -> str:
+    _mark_workbook_for_full_recalc(wb)
+    temp_saved_path = _save_workbook_to_temp_file(wb, out_path)
+    _close_workbook_quietly(wb_values)
+    _close_workbook_quietly(wb)
 
-        os.replace(temp_path, target_path)
-        return True
-    except Exception as e:
-        _safe_call(os.remove, temp_path)
-        print(f"[info] パッケージ復元をスキップしました: {e}")
-        return False
+    try:
+        return _save_preserving_package_parts(
+            source_xlsx_path,
+            temp_saved_path,
+            out_path,
+            sheet_name,
+            changed_refs,
+            parent=parent,
+        )
+    finally:
+        _safe_call(os.remove, temp_saved_path)
 
 
 def _force_excel_recalc_and_save(xlsx_path: str):
+    if os.environ.get(FORCE_EXCEL_RECALC_ENV, "").strip() != "1":
+        print(
+            "[info] Excel強制再計算は既定でスキップします。"
+            f"必要な場合のみ環境変数 {FORCE_EXCEL_RECALC_ENV}=1 で有効化してください。"
+        )
+        return False
+
     try:
         import win32com.client  # type: ignore
     except Exception as e:
@@ -176,6 +429,7 @@ def _force_excel_recalc_and_save(xlsx_path: str):
         excel_app = None
         excel_wb = None
         try:
+            print(f"[info] Excel強制再計算を開始します ({attempt + 1}/3)")
             excel_app = win32com.client.DispatchEx("Excel.Application")
             excel_app.Visible = False
             excel_app.DisplayAlerts = False
@@ -201,6 +455,7 @@ def _force_excel_recalc_and_save(xlsx_path: str):
             }
             if _safe_call(excel_wb.SaveAs, **save_as_kwargs) is None:
                 excel_wb.Save()
+            print("[info] Excel強制再計算が完了しました")
             return True
         except Exception as e:
             last_error = e
@@ -341,7 +596,7 @@ def _normalize_single_cell_array_formulas_in_column(
     col_idx = column_index_from_string(col_letter)
     max_row = ws.max_row or row_start
     end_row = max_row if row_end is None else min(row_end, max_row)
-    rewritten = 0
+    rewritten_refs = set()
 
     start_row = max(row_start, 1)
     for row in range(start_row, end_row + 1):
@@ -360,17 +615,18 @@ def _normalize_single_cell_array_formulas_in_column(
             continue
 
         cell.value = f"={formula_text.lstrip('=')}"
-        rewritten += 1
+        rewritten_refs.add(cell.coordinate)
 
-    return rewritten
+    return rewritten_refs
 
 
 def _build_summary_formula(col_letter: str, row_offset: int) -> str:
     start_row = SUMMARY_FORMULA_BASE_START_ROW + row_offset
     end_row = SUMMARY_FORMULA_BASE_END_ROW + row_offset
+    m = SUMMARY_FORMULA_MOD_DIVISOR
     return (
         f"=SUMPRODUCT(--({col_letter}{start_row}:{col_letter}{end_row}<>\"\"),"
-        f"--(MOD(ROW({col_letter}{start_row}:{col_letter}{end_row})-ROW({col_letter}{start_row}),2)=0))"
+        f"--(MOD(ROW({col_letter}{start_row}:{col_letter}{end_row})-ROW({col_letter}{start_row}),{m})=0))"
     )
 
 
@@ -438,6 +694,7 @@ def _normalize_formula_text(value) -> str:
 def _ensure_summary_formulas(ws):
     summary_col_start = column_index_from_string(SUMMARY_FORMULA_COL_START)
     summary_col_end = column_index_from_string(SUMMARY_FORMULA_COL_END)
+    changed_refs = set()
 
     for col_idx in range(summary_col_start, summary_col_end + 1):
         col_letter = get_column_letter(col_idx)
@@ -453,6 +710,9 @@ def _ensure_summary_formulas(ws):
                 col_letter,
                 row_idx - 1,
             )
+            changed_refs.add(f"{col_letter}{row_idx}")
+
+    return changed_refs
 
 
 def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=None):
@@ -485,6 +745,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
     ws = wb[sheet_name]
     ws_values = wb_values[sheet_name]
+    changed_refs = set()
 
     no_col = column_index_from_string(measure_no_col)
     measure_no_to_row = {}
@@ -509,10 +770,12 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
         tool_cell = _get_writable_cell(ws, current_tool_row, tool_name_col_index)
         tool_cell.value = tool
         tool_row[tool] = tool_cell.row
+        changed_refs.add(tool_cell.coordinate)
         current_tool_row += tool_row_step
 
     auto_data_label_cell = _get_writable_cell(ws, auto_data_start_row, tool_name_col_index)
     auto_data_label_cell.value = f"測定結果貼付は{auto_data_start_row}行から"
+    changed_refs.add(auto_data_label_cell.coordinate)
 
     measure_row_to_tool_rows = {}
     missing_nos = []
@@ -532,7 +795,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
     all_tool_rows = sorted(tool_row.values())
 
-    _ensure_summary_formulas(ws)
+    changed_refs.update(_ensure_summary_formulas(ws))
 
     written = 0
     target_found = 0
@@ -548,6 +811,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
                 tool_row_step=tool_row_step if all_tool_rows else None,
             )
             header_cell.value = header_formula
+            changed_refs.add(header_cell.coordinate)
 
         for measure_row, tool_rows in measure_row_to_tool_rows.items():
             conditions = formula_arg_sep.join([f'{col_letter}${tool_row_index}<>""' for tool_row_index in tool_rows])
@@ -572,6 +836,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             else:
                 target_cell.value = _build_measure_row_formula(conditions, formula_arg_sep)
             written += 1
+            changed_refs.add(target_cell.coordinate)
 
         for measure_no, data_index in measure_no_to_data_index.items():
             measure_row = measure_no_to_row.get(measure_no)
@@ -589,6 +854,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             )
             target_cell.value = f"={auto_formula}"
             written += 1
+            changed_refs.add(target_cell.coordinate)
 
     if target_found == 0:
         raise ValueError(
@@ -604,20 +870,25 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             "3) tool_to_measure_nos のNoがシートに存在しない"
         )
 
-    normalized_count = _normalize_single_cell_array_formulas_in_column(
+    normalized_refs = _normalize_single_cell_array_formulas_in_column(
         ws,
         "B",
         row_start=measure_row_min,
         row_end=measure_row_max,
     )
-    if normalized_count:
-        print(f"[info] B列の単一セル配列数式を通常数式へ変換: {normalized_count}件")
+    if normalized_refs:
+        changed_refs.update(normalized_refs)
+        print(f"[info] B列の単一セル配列数式を通常数式へ変換: {len(normalized_refs)}件")
 
-    _mark_workbook_for_full_recalc(wb)
-    saved_path = _save_workbook_atomic(wb, out_path, parent=parent)
-    _close_workbook_quietly(wb_values)
-    _close_workbook_quietly(wb)
-    _restore_package_parts_from_source(xlsx_path, saved_path)
+    saved_path = _finalize_modified_workbook(
+        wb,
+        wb_values,
+        source_xlsx_path=xlsx_path,
+        out_path=out_path,
+        sheet_name=sheet_name,
+        changed_refs=changed_refs,
+        parent=parent,
+    )
     _force_excel_recalc_and_save(saved_path)
     return saved_path
 
@@ -667,6 +938,7 @@ def write_measurement_not_required(
 
     ws = wb[sheet_name]
     ws_values = wb_values[sheet_name]
+    changed_refs = set()
 
     no_col = column_index_from_string(measure_no_col)
     measure_no_to_row = {}
@@ -702,6 +974,7 @@ def write_measurement_not_required(
     e_col = column_index_from_string("E")
     target_e_cell = _get_writable_cell(ws, target_row, e_col)
     target_e_cell.value = "測定不要"
+    changed_refs.add(target_e_cell.coordinate)
 
     flag_col_start = column_index_from_string("L")
     flag_col_end = column_index_from_string("SR")
@@ -723,6 +996,7 @@ def write_measurement_not_required(
                 target_cell,
                 formula_arg_sep,
             )
+            changed_refs.add(current_cell.coordinate)
         written_count += 1
 
     if written_count == 0 and target_nos:
@@ -745,19 +1019,24 @@ def write_measurement_not_required(
             f"※測定Noが数式の場合、Excelで一度ファイルを開いて保存してから再実行してください。"
         )
 
-    normalized_count = _normalize_single_cell_array_formulas_in_column(
+    normalized_refs = _normalize_single_cell_array_formulas_in_column(
         ws,
         "B",
         row_start=measure_row_min,
         row_end=measure_row_max,
     )
-    if normalized_count:
-        print(f"[info] B列の単一セル配列数式を通常数式へ変換: {normalized_count}件")
+    if normalized_refs:
+        changed_refs.update(normalized_refs)
+        print(f"[info] B列の単一セル配列数式を通常数式へ変換: {len(normalized_refs)}件")
 
-    _mark_workbook_for_full_recalc(wb)
-    saved_path = _save_workbook_atomic(wb, out_path, parent=parent)
-    _close_workbook_quietly(wb_values)
-    _close_workbook_quietly(wb)
-    _restore_package_parts_from_source(xlsx_path, saved_path)
+    saved_path = _finalize_modified_workbook(
+        wb,
+        wb_values,
+        source_xlsx_path=xlsx_path,
+        out_path=out_path,
+        sheet_name=sheet_name,
+        changed_refs=changed_refs,
+        parent=parent,
+    )
     _force_excel_recalc_and_save(saved_path)
     return saved_path

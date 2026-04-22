@@ -107,10 +107,10 @@ def build_exe():
     
     try:
         subprocess.check_call(cmd)
-        print("\n✓ ビルドが完了しました！")
-        print(f"exeファイルは dist/AutoMesureOrderRequest.exe に生成されました。")
+        print("\n[OK] ビルドが完了しました。")
+        print("exe ファイル: dist/FlagAutoGenerator.exe")
     except subprocess.CalledProcessError as e:
-        print(f"\n✗ ビルドに失敗しました: {e}")
+        print(f"\n[NG] ビルドに失敗しました: {e}")
         sys.exit(1)
 
 
