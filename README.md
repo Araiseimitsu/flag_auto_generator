@@ -40,6 +40,13 @@ pip install -r requirements.txt
 py -3.12 .\flag_auto_generator.py
 ```
 
+内部実装は以下のように分割しています。
+
+- 起動入口: `flag_auto_generator.py`
+- GUI本体: `flag_auto_generator_app/gui.py`
+- Excel処理: `flag_auto_generator_app/excel_ops.py`
+- GUI共通部品: `flag_auto_generator_app/ui_helpers.py`
+
 ### EXEビルド（任意）
 
 ```powershell
