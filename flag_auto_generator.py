@@ -8,11 +8,13 @@ import zipfile
 
 import ttkbootstrap as tb
 from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.worksheet.formula import ArrayFormula
 
 
 AUTO_DATA_START_ROW_DEFAULT = 230
+NOT_REQUIRED_ROW_DEFAULT = 197
 AUTO_DATA_MAX_ITEMS = 100
 REQUEST_HEADER_ROW = 10
 SUMMARY_FORMULA_COL_START = "L"
@@ -31,6 +33,28 @@ LOCKED_BASIC_SETTINGS = {
     "tool_name_col": "E",
     "tool_row_step": 3,
 }
+
+
+def _derive_layout_rows(not_required_row: int, measure_row_min: int) -> tuple[int, int]:
+    measure_row_max = max(not_required_row - 1, measure_row_min)
+    tool_start_row = max(not_required_row + 3, 1)
+    return measure_row_max, tool_start_row
+
+
+def _derive_auto_data_start_row(not_required_row: int, tool_count: int) -> int:
+    return not_required_row + (tool_count * LOCKED_BASIC_SETTINGS["tool_row_step"]) + 6
+
+
+def _get_writable_cell(ws, row: int, col: int):
+    cell = ws.cell(row, col)
+    if not isinstance(cell, MergedCell):
+        return cell
+
+    for merged_range in ws.merged_cells.ranges:
+        if merged_range.min_row <= row <= merged_range.max_row and merged_range.min_col <= col <= merged_range.max_col:
+            return ws.cell(merged_range.min_row, merged_range.min_col)
+
+    return cell
 
 
 def pick_file(title: str, filetypes, parent=None):
@@ -317,7 +341,9 @@ def _build_not_required_overlay_formula(
 ):
     base_expression = _to_formula_expression(current_value)
     return (
-        f'=IF(IFERROR(LEN(TRIM({trigger_cell_ref}&"")){sep}0)>0{sep}"-"{sep}{base_expression})'
+        f'=IF(IFERROR(LEN(TRIM(({base_expression})&"")){sep}0)>0{sep}'
+        f'({base_expression}){sep}'
+        f'IF(IFERROR(LEN(TRIM({trigger_cell_ref}&"")){sep}0)>0{sep}"-"{sep}""))'
     )
 
 
@@ -380,24 +406,59 @@ def _build_summary_formula(col_letter: str, row_offset: int) -> str:
     )
 
 
+def _build_stepped_non_empty_count_formula(
+    col_letter: str,
+    row_min: int,
+    row_max: int,
+    row_step: int,
+    sep: str,
+) -> str:
+    target_range = f"{col_letter}{row_min}:{col_letter}{row_max}"
+    start_ref = f"{col_letter}{row_min}"
+    return (
+        f'SUMPRODUCT(--(LEN(TRIM({target_range}&""))>0){sep}'
+        f'--(MOD(ROW({target_range})-ROW({start_ref}){sep}{row_step})=0))'
+    )
+
+
+def _build_request_formula(conditions: str, fallback_expression: str = '""') -> str:
+    return f'=IF(OR({conditions}),"依頼",{fallback_expression})'
+
+
+def _build_measure_row_formula(
+    request_conditions: str,
+    sep: str,
+    auto_formula: str | None = None,
+) -> str:
+    if auto_formula is not None:
+        auto_expression = _strip_formula_prefix(auto_formula)
+        return (
+            f'=IF(LEN(TRIM(({auto_expression})&""))>0{sep}'
+            f'({auto_expression}){sep}'
+            f'IF(OR({request_conditions}){sep}"依頼"{sep}""))'
+        )
+    return _build_request_formula(request_conditions)
+
+
 def _build_request_header_formula(
     col_letter: str,
     measure_row_min: int,
     measure_row_max: int,
     measure_row_step: int,
     sep: str,
+    tool_row_min: int | None = None,
+    tool_row_max: int | None = None,
+    tool_row_step: int | None = None,
 ) -> str:
-    target_range = f"{col_letter}{measure_row_min}:{col_letter}{measure_row_max}"
-    start_ref = f"{col_letter}{measure_row_min}"
-    return (
-        f'=IF(SUMPRODUCT(--({target_range}<>"")){sep}'
-        f'--(MOD(ROW({target_range})-ROW({start_ref}){sep}{measure_row_step})=0))>0{sep}'
-        f'"依頼"{sep}"")'
-    )
-
-
-def _build_request_formula(conditions: str, fallback_expression: str = '""') -> str:
-    return f'=IF(OR({conditions}),"依頼",{fallback_expression})'
+    conditions = [
+        f"{_build_stepped_non_empty_count_formula(col_letter, measure_row_min, measure_row_max, measure_row_step, sep)}>0"
+    ]
+    if tool_row_min is not None and tool_row_max is not None and tool_row_step:
+        conditions.insert(
+            0,
+            f"{_build_stepped_non_empty_count_formula(col_letter, tool_row_min, tool_row_max, tool_row_step, sep)}>0",
+        )
+    return _build_request_formula(sep.join(conditions))
 
 
 def _strip_formula_prefix(formula_text: str) -> str:
@@ -489,13 +550,13 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     tool_name_c = column_index_from_string(tool_name_col)
     r = tool_start_row
     for tool in tools:
-        tool_cell = ws.cell(r, tool_name_c)
+        tool_cell = _get_writable_cell(ws, r, tool_name_c)
         tool_cell.value = tool
-        tool_row[tool] = r
+        tool_row[tool] = tool_cell.row
         r += tool_row_step
 
     # 2.5) 自動測定データ開始行のE列に案内を記入
-    auto_data_label_cell = ws.cell(auto_data_start_row, tool_name_c)
+    auto_data_label_cell = _get_writable_cell(ws, auto_data_start_row, tool_name_c)
     auto_data_label_cell.value = f"測定結果貼付は{auto_data_start_row}行から"
 
     # 3) 測定行ごとに参照すべき工具行（逆引き）
@@ -532,17 +593,11 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
                 measure_row_max=measure_row_max,
                 measure_row_step=measure_row_step,
                 sep=formula_arg_sep,
+                tool_row_min=all_tool_rows[0] if all_tool_rows else None,
+                tool_row_max=all_tool_rows[-1] if all_tool_rows else None,
+                tool_row_step=tool_row_step if all_tool_rows else None,
             )
-            if all_tool_rows:
-                summary_conds = formula_arg_sep.join(
-                    [f'{col_letter}${tr}<>""' for tr in all_tool_rows]
-                )
-                header_cell.value = _build_request_formula(
-                    summary_conds,
-                    _strip_formula_prefix(header_formula),
-                )
-            else:
-                header_cell.value = header_formula
+            header_cell.value = header_formula
 
         # 測定行に依頼セルを設定
         for mr, tool_rows in measure_row_to_tool_rows.items():
@@ -560,9 +615,13 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
                     data_index=data_index,
                     sep=formula_arg_sep,
                 )
-                target_cell.value = _build_request_formula(conds, auto_formula)
+                target_cell.value = _build_measure_row_formula(
+                    conds,
+                    formula_arg_sep,
+                    auto_formula,
+                )
             else:
-                target_cell.value = _build_request_formula(conds)
+                target_cell.value = _build_measure_row_formula(conds, formula_arg_sep)
             written += 1
 
         # 工具に紐づかない行には自動測定データ反映式のみを設定
@@ -639,7 +698,7 @@ def write_measurement_not_required(
     parent=None,
 ):
     """
-    工具開始行-3行目のE列に"測定不要"を書き込み、指定したNo.の行のL～SR列に条件付きで"-"を書き込む
+    指定した行のE列に"測定不要"を書き込み、指定したNo.の行のL～SR列に条件付きで"-"を書き込む
 
     Args:
         xlsx_path: 入力Excelファイルのパス
@@ -657,6 +716,7 @@ def write_measurement_not_required(
     sheet_name = cfg.get("sheet_name", "工程内検査シート")
     measure_no_col = cfg.get("measure_no_col", "A")
     tool_start_row = int(cfg.get("tool_start_row", 200))
+    not_required_row = int(cfg.get("not_required_row", tool_start_row - 3))
     measure_row_min = int(cfg.get("measure_row_min", 11))
     measure_row_step = int(cfg.get("measure_row_step", 3))
     measure_row_max = int(cfg.get("measure_row_max", tool_start_row - 4))
@@ -705,11 +765,11 @@ def write_measurement_not_required(
             continue
         measure_no_to_row[no] = r
 
-    target_row = tool_start_row - 3
+    target_row = not_required_row
 
-    # 2) 指定行のE列に"測定不要"を書き込み（工具開始行-3）
+    # 2) 指定行のE列に"測定不要"を書き込み
     e_col = column_index_from_string("E")
-    target_e_cell = ws.cell(target_row, e_col)
+    target_e_cell = _get_writable_cell(ws, target_row, e_col)
     target_e_cell.value = "測定不要"
 
     # 3) 指定したNo.の行のL～SR列に条件付きで"-"を書き込む
@@ -833,8 +893,11 @@ class ConfigEditor(tb.Window):
 
         measure_row_min_default = LOCKED_BASIC_SETTINGS["measure_row_min"]
         measure_row_step_default = LOCKED_BASIC_SETTINGS["measure_row_step"]
-        tool_start_default = 200
-        measure_row_max_default = max(tool_start_default - 4, measure_row_min_default)
+        not_required_row_default = NOT_REQUIRED_ROW_DEFAULT
+        measure_row_max_default, tool_start_default = _derive_layout_rows(
+            not_required_row_default,
+            measure_row_min_default,
+        )
         summary_row_min_default = LOCKED_BASIC_SETTINGS["summary_row_min"]
         summary_row_max_default = measure_row_max_default
         summary_row_step_default = LOCKED_BASIC_SETTINGS["summary_row_step"]
@@ -853,9 +916,8 @@ class ConfigEditor(tb.Window):
             "tool_start_row": tk.IntVar(value=tool_start_default),
             "tool_name_col": tk.StringVar(value=LOCKED_BASIC_SETTINGS["tool_name_col"]),
             "tool_row_step": tk.IntVar(value=tool_row_step_default),
-            "auto_data_start_row": tk.IntVar(value=AUTO_DATA_START_ROW_DEFAULT),
             "not_required_row": tk.StringVar(
-                value=str(max(tool_start_default - 3, 1))
+                value=str(not_required_row_default)
             ),
             "not_required_nos": tk.StringVar(value=""),
         }
@@ -967,42 +1029,23 @@ class ConfigEditor(tb.Window):
         basic_right = ttk.LabelFrame(basic_inner, text="測定不要書き込み設定", padding=10)
         basic_right.grid(row=0, column=1, sticky="nsew")
 
-        def add_field(row, col, label, key, width=12, editable=True):
-            col_offset = col * 2
-            ttk.Label(basic_left, text=label).grid(row=row, column=col_offset, sticky="w", padx=(0, 8), pady=3)
+        def add_field(parent, row, label, key, width=12, editable=True):
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
             if editable:
-                ttk.Entry(basic_left, textvariable=self.vars[key], width=width).grid(row=row, column=col_offset + 1, sticky="w", padx=(0, 20), pady=3)
+                ttk.Entry(parent, textvariable=self.vars[key], width=width).grid(row=row, column=1, sticky="w", padx=(0, 20), pady=3)
                 return
             ttk.Label(
-                basic_left,
+                parent,
                 text=str(self.vars[key].get()),
                 width=width,
-            ).grid(row=row, column=col_offset + 1, sticky="w", padx=(0, 20), pady=3)
+            ).grid(row=row, column=1, sticky="w", padx=(0, 20), pady=3)
 
-        add_field(0, 0, "シート名", "sheet_name", width=25)
-        add_field(1, 0, "測定No列", "measure_no_col", editable=False)
-        add_field(2, 0, "測定行(min)", "measure_row_min", editable=False)
-        add_field(3, 0, "測定行(max)", "measure_row_max")
-        add_field(4, 0, "測定行ステップ", "measure_row_step", editable=False)
-        add_field(5, 0, "集計行(min)", "summary_row_min", editable=False)
-        add_field(7, 0, "集計行ステップ", "summary_row_step", editable=False)
-        add_field(0, 1, "数式区切り(, / ;)", "formula_arg_sep", editable=False)
-        add_field(1, 1, "工具開始行", "tool_start_row")
-        add_field(2, 1, "工具名列", "tool_name_col", editable=False)
-        add_field(3, 1, "工具行ステップ", "tool_row_step", editable=False)
-        add_field(4, 1, "自動測定データ開始行", "auto_data_start_row")
-        ttk.Label(
-            basic,
-            text="固定項目: 測定No列 A / 測定行(min) 11 / 測定行ステップ 3 / 集計行(min) 11 / 集計行(max) は測定行(max) と連動 / 集計行ステップ 3 / 数式区切り , / 工具名列 E / 工具行ステップ 3",
-        ).pack(anchor="w", pady=(6, 3))
-
-        ttk.Label(basic, text="出力列: L～SR（固定）").pack(anchor="w", pady=3)
-        ttk.Label(basic_right, text="E列 (工具開始行-3) の行番号:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+        add_field(basic_left, 0, "シート名", "sheet_name", width=25)
+        ttk.Label(basic_right, text="測定不要書き込み設定の行:").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
         ttk.Entry(
             basic_right,
             textvariable=self.vars["not_required_row"],
             width=15,
-            state="readonly",
         ).grid(row=0, column=1, sticky="w", padx=(0, 30), pady=5)
         ttk.Label(
             basic_right,
@@ -1098,7 +1141,7 @@ class ConfigEditor(tb.Window):
             self.main_canvas.yview_scroll(1, "units")
 
     def _bind_basic_setting_sync(self):
-        self.vars["tool_start_row"].trace_add("write", self._sync_tool_start_row)
+        self.vars["not_required_row"].trace_add("write", self._sync_not_required_row)
         self.vars["measure_row_min"].trace_add("write", self._sync_measure_row_min)
         self.vars["measure_row_max"].trace_add("write", self._sync_measure_row_max)
         self.vars["measure_row_step"].trace_add("write", self._sync_measure_row_step)
@@ -1108,19 +1151,17 @@ class ConfigEditor(tb.Window):
             if self.vars[key].get() != value:
                 self.vars[key].set(value)
 
-    def _sync_tool_start_row(self, *args):
+    def _sync_not_required_row(self, *args):
         try:
-            tool_start = self.vars["tool_start_row"].get()
-        except tk.TclError:
+            not_required_row = int(self.vars["not_required_row"].get())
+        except (tk.TclError, ValueError):
             return
         min_row = self.vars["measure_row_min"].get()
-        desired_max = max(tool_start - 4, min_row)
+        desired_max, desired_tool_start = _derive_layout_rows(not_required_row, min_row)
         if self.vars["measure_row_max"].get() != desired_max:
             self.vars["measure_row_max"].set(desired_max)
-        target_row = max(tool_start - 3, 1)
-        desired_row_str = str(target_row)
-        if self.vars["not_required_row"].get() != desired_row_str:
-            self.vars["not_required_row"].set(desired_row_str)
+        if self.vars["tool_start_row"].get() != desired_tool_start:
+            self.vars["tool_start_row"].set(desired_tool_start)
 
     def _sync_measure_row_min(self, *args):
         try:
@@ -1456,20 +1497,39 @@ class ConfigEditor(tb.Window):
             if not tools:
                 raise ValueError("工具が1件もありません。")
 
+            not_required_row_text = self.vars["not_required_row"].get().strip()
+            not_required_row = _try_extract_int(not_required_row_text)
+            if not_required_row is None:
+                raise ValueError("測定不要書き込み設定の行は整数で入力してください。")
+
+            measure_row_min = LOCKED_BASIC_SETTINGS["measure_row_min"]
+            measure_row_max, tool_start_row = _derive_layout_rows(
+                not_required_row,
+                measure_row_min,
+            )
+            if measure_row_max < measure_row_min:
+                raise ValueError(
+                    f"測定不要書き込み設定の行は {measure_row_min + 1} 以上で入力してください。"
+                )
+            if tool_start_row < 1:
+                raise ValueError("自動計算後の工具開始行が1未満になります。入力値を見直してください。")
+            auto_data_start_row = _derive_auto_data_start_row(not_required_row, len(tools))
+
             cfg = {
                 "sheet_name": self.vars["sheet_name"].get().strip(),
                 "measure_no_col": LOCKED_BASIC_SETTINGS["measure_no_col"],
-                "measure_row_min": LOCKED_BASIC_SETTINGS["measure_row_min"],
-                "measure_row_max": int(self.vars["measure_row_max"].get()),
+                "measure_row_min": measure_row_min,
+                "measure_row_max": measure_row_max,
                 "measure_row_step": LOCKED_BASIC_SETTINGS["measure_row_step"],
                 "summary_row_min": LOCKED_BASIC_SETTINGS["summary_row_min"],
-                "summary_row_max": int(self.vars["measure_row_max"].get()),
+                "summary_row_max": measure_row_max,
                 "summary_row_step": LOCKED_BASIC_SETTINGS["summary_row_step"],
                 "formula_arg_sep": LOCKED_BASIC_SETTINGS["formula_arg_sep"],
-                "tool_start_row": int(self.vars["tool_start_row"].get()),
+                "tool_start_row": tool_start_row,
+                "not_required_row": not_required_row,
                 "tool_name_col": LOCKED_BASIC_SETTINGS["tool_name_col"],
                 "tool_row_step": LOCKED_BASIC_SETTINGS["tool_row_step"],
-                "auto_data_start_row": int(self.vars["auto_data_start_row"].get()),
+                "auto_data_start_row": auto_data_start_row,
                 "measure_no_to_data_index": measure_no_to_data_index,
                 "tools": tools,
                 "tool_to_measure_nos": tool_to_measure_nos,
@@ -1664,9 +1724,10 @@ class ConfigEditor(tb.Window):
         usage_text = """
     【基本設定】
     1. 先に「Excelを選択」で元ファイルを読み込み、プレビューで対象シートを確認します
-    2. シート名・測定行(max)・工具開始行を必要に応じて調整します
-    3. 次の項目は固定で変更できません: 測定No列 A / 測定行(min) 11 / 測定行ステップ 3 / 集計行(min) 11 / 集計行(max) は測定行(max) と連動 / 集計行ステップ 3 / 数式区切り , / 工具名列 E / 工具行ステップ 3
-    4. 出力列は L～SR 固定です
+    2. 基本設定では「シート名」だけを必要に応じて調整します
+    3. 測定不要書き込み設定の行を入力すると、測定行(max) はその1つ上、工具開始行はその3つ下として内部で自動計算します
+    4. 自動測定データ開始行は「測定不要書き込み設定の行 + (工具数 × 3) + 6」で内部自動計算します
+    5. 出力列は L～SR 固定です
 
     【先頭集計式の注意】
     1. 1行目の基準式は =SUMPRODUCT(--(L11:L308<>""),--(MOD(ROW(L11:L308)-ROW(L11),2)=0)) です
@@ -1677,7 +1738,7 @@ class ConfigEditor(tb.Window):
     1. 「工具追加」で工具名と測定No（カンマ区切り）を登録します
     2. 工具行の同じ列に値が入った場合、10行目も「依頼」になります
     3. 登録した測定Noの行に、列ごとに「依頼」判定式が設定されます
-    4. 同じ測定Noが自動測定データ対応にもある場合は、工具条件が成立すると「依頼」を優先します
+    4. 同じ測定Noが自動測定データ対応にもある場合は、自動測定結果参照を優先し、参照結果が空のときだけ「依頼」を表示します
 
     【注意】
     1. 生成したファイルを開くと「作成されたファイルを修正しますか？」と表示される場合があります
@@ -1685,14 +1746,14 @@ class ConfigEditor(tb.Window):
     3. 書式やレイアウトが変わっている場合は、必要な関数のみを既存のExcelへ貼り付けて使用してください
 
     【自動測定結果の反映】
-    1. 「自動測定データ開始行」は既定で230行です
+    1. 自動測定データ開始行は「測定不要書き込み設定の行 + (工具数 × 3) + 6」で自動計算します
     2. 「測定No → データ順番」を追加すると、対応する測定行のL～SRに自動測定結果参照式を設定します
     3. データ順番が1なら開始行、2なら開始行+1…を同じ列で参照します
 
     【測定不要書き込み設定（任意）】
-    1. No.欄に測定Noを入れると、生成後に追加処理として測定不要式を設定します
-    2. 工具開始行-3行目のE列には「測定不要」を書き込みます
-    3. 指定Noの行のL～SRには、同列の「測定不要」行が入力されたときだけ「-」を表示し、未入力時は既存の依頼式・自動測定式をそのまま動かす式を設定します
+    1. 「測定不要書き込み設定の行」には、E列へ「測定不要」を書き込む行番号を入力します
+    2. No.欄に測定Noを入れると、生成後に追加処理として測定不要式を設定します
+    3. 指定Noの行のL～SRでは、自動測定結果参照と「依頼」を優先し、どちらも空のときだけ同列の「測定不要」入力に応じて「-」を表示します
 
     【Excel生成の処理順】
     1. 「この設定でExcel生成」を押して出力先を指定します
