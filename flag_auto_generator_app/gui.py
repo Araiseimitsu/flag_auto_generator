@@ -52,6 +52,9 @@ class ConfigEditor(tb.Window):
         measure_row_min_default = LOCKED_BASIC_SETTINGS["measure_row_min"]
         measure_row_step_default = LOCKED_BASIC_SETTINGS["measure_row_step"]
         not_required_row_default = NOT_REQUIRED_ROW_DEFAULT
+        self.not_required_row_choices = tuple(
+            str(row) for row in range(measure_row_min_default + 3, 302, measure_row_step_default)
+        )
         measure_row_max_default, tool_start_default = _derive_layout_rows(
             not_required_row_default,
             measure_row_min_default,
@@ -242,11 +245,22 @@ class ConfigEditor(tb.Window):
         basic_right.grid(row=0, column=1, sticky=tk.NSEW)
         ttk.Label(
             basic_right,
-            text="L～SR で「-」にしたい測定 No（1件ずつ登録）",
+            text="E 列の「測定不要」行と、L～SR で「-」にしたい測定 No を設定します。",
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
 
+        not_req_setting_row = ttk.Frame(basic_right, style="Surface.TFrame")
+        not_req_setting_row.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        ttk.Label(not_req_setting_row, text="測定不要の開始行").pack(side=tk.LEFT)
+        ttk.Combobox(
+            not_req_setting_row,
+            textvariable=self.vars["not_required_row"],
+            values=self.not_required_row_choices,
+            width=10,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
         not_req_row = ttk.Frame(basic_right, style="Surface.TFrame")
-        not_req_row.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 6))
+        not_req_row.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(0, 6))
         ttk.Label(not_req_row, text="測定 No").pack(side=tk.LEFT)
         ttk.Entry(
             not_req_row,
@@ -267,7 +281,7 @@ class ConfigEditor(tb.Window):
         ).pack(side=tk.LEFT)
 
         nr_list_frame = ttk.Frame(basic_right, style="Surface.TFrame")
-        nr_list_frame.grid(row=2, column=0, columnspan=2, sticky=tk.NSEW, pady=(0, 4))
+        nr_list_frame.grid(row=3, column=0, columnspan=2, sticky=tk.NSEW, pady=(0, 4))
         self.not_required_nos_tree = ttk.Treeview(
             nr_list_frame,
             columns=("no",),

@@ -4,7 +4,6 @@ PyInstallerでexe化するためのビルドスクリプト
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -92,13 +91,6 @@ def build_exe():
         "--name=FlagAutoGenerator",  # exeファイル名
         "--clean",  # ビルド前に一時ファイルをクリーンアップ
         "--collect-all", "ttkbootstrap",  # ttkbootstrapのデータを全て収集
-        "--hidden-import=ttkbootstrap",
-        "--hidden-import=ttkbootstrap.ttk",
-        "--hidden-import=ttkbootstrap.constants",
-        "--hidden-import=ttkbootstrap.style",
-        "--hidden-import=ttkbootstrap.validation",
-        "--hidden-import=ttkbootstrap.tooltip",
-        "--hidden-import=ttkbootstrap.dialogs",
         script_name
     ]
     

@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['ttkbootstrap', 'ttkbootstrap.ttk', 'ttkbootstrap.constants', 'ttkbootstrap.style', 'ttkbootstrap.validation', 'ttkbootstrap.tooltip', 'ttkbootstrap.dialogs']
+hiddenimports = []
 tmp_ret = collect_all('ttkbootstrap')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
