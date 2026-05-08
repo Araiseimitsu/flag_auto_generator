@@ -14,9 +14,12 @@ from openpyxl.worksheet.formula import ArrayFormula
 from tkinter import messagebox
 
 
-# 測定不要行デフォルト 122。配下の自動データ開始行フォールバックは 1 工具想定: 122 + 3 + 6
-AUTO_DATA_START_ROW_DEFAULT = 131
-NOT_REQUIRED_ROW_DEFAULT = 122
+# 最終測定行デフォルト 121。測定不要行は 3 行空けて 125 に配置する。
+MEASURE_ROW_MAX_DEFAULT = 121
+NOT_REQUIRED_ROW_GAP_ROWS = 4
+NOT_REQUIRED_ROW_DEFAULT = MEASURE_ROW_MAX_DEFAULT + NOT_REQUIRED_ROW_GAP_ROWS
+# 配下の自動データ開始行フォールバックは 1 工具想定: 125 + 3 + 6
+AUTO_DATA_START_ROW_DEFAULT = 134
 AUTO_DATA_MAX_ITEMS = 100
 REQUEST_HEADER_ROW = 10
 SUMMARY_FORMULA_COL_START = "L"
@@ -25,7 +28,6 @@ REQUEST_OUTPUT_COL_START = "L"
 REQUEST_OUTPUT_COL_END = "SR"
 # 1〜3 行目の SUMPRODUCT: 行ごとに開始/終了が 1 行ずつずれる（L11:L119 / L12:L120 / L13:L121）
 SUMMARY_FORMULA_BASE_START_ROW = 11
-SUMMARY_FORMULA_BASE_END_ROW = 119
 SUMMARY_FORMULA_MOD_DIVISOR = 3
 LOCKED_BASIC_SETTINGS = {
     "measure_no_col": "A",
@@ -73,10 +75,12 @@ ET.register_namespace("xr10", XR10_NS)
 ET.register_namespace("xcalcf", XCALCF_NS)
 
 
-def _derive_layout_rows(not_required_row: int, measure_row_min: int) -> tuple[int, int]:
-    measure_row_max = max(not_required_row - 1, measure_row_min)
-    tool_start_row = max(not_required_row + 3, 1)
-    return measure_row_max, tool_start_row
+def _derive_layout_rows(measure_row_max: int, measure_row_min: int) -> tuple[int, int]:
+    min_measure_row_max = measure_row_min + LOCKED_BASIC_SETTINGS["measure_row_step"] - 1
+    bounded_measure_row_max = max(measure_row_max, min_measure_row_max)
+    not_required_row = bounded_measure_row_max + NOT_REQUIRED_ROW_GAP_ROWS
+    tool_start_row = max(not_required_row + LOCKED_BASIC_SETTINGS["tool_row_step"], 1)
+    return not_required_row, tool_start_row
 
 
 def _derive_auto_data_start_row(not_required_row: int, tool_count: int) -> int:
@@ -620,9 +624,9 @@ def _normalize_single_cell_array_formulas_in_column(
     return rewritten_refs
 
 
-def _build_summary_formula(col_letter: str, row_offset: int) -> str:
+def _build_summary_formula(col_letter: str, row_offset: int, summary_row_max: int) -> str:
     start_row = SUMMARY_FORMULA_BASE_START_ROW + row_offset
-    end_row = SUMMARY_FORMULA_BASE_END_ROW + row_offset
+    end_row = summary_row_max - 2 + row_offset
     m = SUMMARY_FORMULA_MOD_DIVISOR
     return (
         f"=SUMPRODUCT(--({col_letter}{start_row}:{col_letter}{end_row}<>\"\"),"
@@ -691,14 +695,14 @@ def _normalize_formula_text(value) -> str:
     return re.sub(r"\s+", "", str(value)).replace("$", "").upper()
 
 
-def _ensure_summary_formulas(ws):
+def _ensure_summary_formulas(ws, summary_row_max: int):
     summary_col_start = column_index_from_string(SUMMARY_FORMULA_COL_START)
     summary_col_end = column_index_from_string(SUMMARY_FORMULA_COL_END)
     changed_refs = set()
 
     for col_idx in range(summary_col_start, summary_col_end + 1):
         col_letter = get_column_letter(col_idx)
-        expected_row1_formula = _build_summary_formula(col_letter, 0)
+        expected_row1_formula = _build_summary_formula(col_letter, 0, summary_row_max)
         row1_cell = ws.cell(1, col_idx)
         if _normalize_formula_text(row1_cell.value) == _normalize_formula_text(
             expected_row1_formula
@@ -709,6 +713,7 @@ def _ensure_summary_formulas(ws):
             ws.cell(row_idx, col_idx).value = _build_summary_formula(
                 col_letter,
                 row_idx - 1,
+                summary_row_max,
             )
             changed_refs.add(f"{col_letter}{row_idx}")
 
@@ -722,6 +727,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
     measure_row_step = int(cfg.get("measure_row_step", 3))
     tool_start_row = int(cfg.get("tool_start_row", 200))
     measure_row_max = int(cfg.get("measure_row_max", tool_start_row - 4))
+    summary_row_max = int(cfg.get("summary_row_max", measure_row_max))
     formula_arg_sep = str(cfg.get("formula_arg_sep", ",")).strip() or ","
     flag_col_start = column_index_from_string(REQUEST_OUTPUT_COL_START)
     flag_col_end = column_index_from_string(REQUEST_OUTPUT_COL_END)
@@ -795,7 +801,7 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
 
     all_tool_rows = sorted(tool_row.values())
 
-    changed_refs.update(_ensure_summary_formulas(ws))
+    changed_refs.update(_ensure_summary_formulas(ws, summary_row_max))
 
     written = 0
     target_found = 0
@@ -814,7 +820,10 @@ def build_request_formulas(xlsx_path: str, out_path: str, cfg: dict, *, parent=N
             changed_refs.add(header_cell.coordinate)
 
         for measure_row, tool_rows in measure_row_to_tool_rows.items():
-            conditions = formula_arg_sep.join([f'{col_letter}${tool_row_index}<>""' for tool_row_index in tool_rows])
+            conditions = formula_arg_sep.join(
+                f'{col_letter}${tool_row_index}<>""'
+                for tool_row_index in tool_rows
+            )
             measure_no = measure_row_to_no.get(measure_row)
             data_index = measure_no_to_data_index.get(measure_no)
             target_found += 1

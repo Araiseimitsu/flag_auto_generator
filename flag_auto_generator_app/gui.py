@@ -11,7 +11,7 @@ from .help_dialog import open_help_window
 from .excel_ops import (
     AUTO_DATA_MAX_ITEMS,
     LOCKED_BASIC_SETTINGS,
-    NOT_REQUIRED_ROW_DEFAULT,
+    MEASURE_ROW_MAX_DEFAULT,
     _derive_auto_data_start_row,
     _derive_layout_rows,
     _normalize_measure_no_key,
@@ -51,12 +51,17 @@ class ConfigEditor(tb.Window):
 
         measure_row_min_default = LOCKED_BASIC_SETTINGS["measure_row_min"]
         measure_row_step_default = LOCKED_BASIC_SETTINGS["measure_row_step"]
-        not_required_row_default = NOT_REQUIRED_ROW_DEFAULT
-        self.not_required_row_choices = tuple(
-            str(row) for row in range(measure_row_min_default + 3, 302, measure_row_step_default)
+        measure_row_max_default = MEASURE_ROW_MAX_DEFAULT
+        self.measure_row_max_choices = tuple(
+            str(row)
+            for row in range(
+                measure_row_min_default + measure_row_step_default - 1,
+                302,
+                measure_row_step_default,
+            )
         )
-        measure_row_max_default, tool_start_default = _derive_layout_rows(
-            not_required_row_default,
+        not_required_row_default, tool_start_default = _derive_layout_rows(
+            measure_row_max_default,
             measure_row_min_default,
         )
         summary_row_min_default = LOCKED_BASIC_SETTINGS["summary_row_min"]
@@ -77,7 +82,7 @@ class ConfigEditor(tb.Window):
             "tool_start_row": tk.IntVar(value=tool_start_default),
             "tool_name_col": tk.StringVar(value=LOCKED_BASIC_SETTINGS["tool_name_col"]),
             "tool_row_step": tk.IntVar(value=tool_row_step_default),
-            "not_required_row": tk.StringVar(value=str(not_required_row_default)),
+            "not_required_row": tk.IntVar(value=not_required_row_default),
         }
 
         self.not_required_no_input_var = tk.StringVar(value="")
@@ -208,8 +213,8 @@ class ConfigEditor(tb.Window):
         make_step_caption(
             main,
             2,
-            "基本のシート名と「測定不要」の行",
-            "いつも使うシート名に合わせます。E 列の「測定不要」が入る行を指定します。",
+            "基本のシート名と最終測定行",
+            "いつも使うシート名と測定行の終端に合わせます。E 列の「測定不要」行は自動計算します。",
         )
         basic = ttk.LabelFrame(main, text="基本・測定不要", padding=14)
         basic.configure(style="AppCard.TLabelframe")
@@ -245,16 +250,16 @@ class ConfigEditor(tb.Window):
         basic_right.grid(row=0, column=1, sticky=tk.NSEW)
         ttk.Label(
             basic_right,
-            text="E 列の「測定不要」行と、L～SR で「-」にしたい測定 No を設定します。",
+            text="最終測定行と、L～SR で「-」にしたい測定 No を設定します。",
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
 
         not_req_setting_row = ttk.Frame(basic_right, style="Surface.TFrame")
         not_req_setting_row.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
-        ttk.Label(not_req_setting_row, text="測定不要の開始行").pack(side=tk.LEFT)
+        ttk.Label(not_req_setting_row, text="最終測定行").pack(side=tk.LEFT)
         ttk.Combobox(
             not_req_setting_row,
-            textvariable=self.vars["not_required_row"],
-            values=self.not_required_row_choices,
+            textvariable=self.vars["measure_row_max"],
+            values=self.measure_row_max_choices,
             width=10,
             state="readonly",
         ).pack(side=tk.LEFT, padx=(8, 0))
@@ -466,7 +471,6 @@ class ConfigEditor(tb.Window):
             self.main_canvas.yview_scroll(1, "units")
 
     def _bind_basic_setting_sync(self):
-        self.vars["not_required_row"].trace_add("write", self._sync_not_required_row)
         self.vars["measure_row_min"].trace_add("write", self._sync_measure_row_min)
         self.vars["measure_row_max"].trace_add("write", self._sync_measure_row_max)
         self.vars["measure_row_step"].trace_add("write", self._sync_measure_row_step)
@@ -475,18 +479,6 @@ class ConfigEditor(tb.Window):
         for key, value in LOCKED_BASIC_SETTINGS.items():
             if self.vars[key].get() != value:
                 self.vars[key].set(value)
-
-    def _sync_not_required_row(self, *args):
-        try:
-            not_required_row = int(self.vars["not_required_row"].get())
-        except (tk.TclError, ValueError):
-            return
-        min_row = self.vars["measure_row_min"].get()
-        desired_max, desired_tool_start = _derive_layout_rows(not_required_row, min_row)
-        if self.vars["measure_row_max"].get() != desired_max:
-            self.vars["measure_row_max"].set(desired_max)
-        if self.vars["tool_start_row"].get() != desired_tool_start:
-            self.vars["tool_start_row"].set(desired_tool_start)
 
     def _sync_measure_row_min(self, *args):
         try:
@@ -503,6 +495,12 @@ class ConfigEditor(tb.Window):
         except tk.TclError:
             return
         self.vars["summary_row_max"].set(max_row)
+        min_row = self.vars["measure_row_min"].get()
+        desired_not_required, desired_tool_start = _derive_layout_rows(max_row, min_row)
+        if self.vars["not_required_row"].get() != desired_not_required:
+            self.vars["not_required_row"].set(desired_not_required)
+        if self.vars["tool_start_row"].get() != desired_tool_start:
+            self.vars["tool_start_row"].set(desired_tool_start)
 
     def _sync_measure_row_step(self, *args):
         try:
@@ -866,17 +864,14 @@ class ConfigEditor(tb.Window):
             if not tools:
                 raise ValueError("工具が1件もありません。")
 
-            not_required_row_text = self.vars["not_required_row"].get().strip()
-            not_required_row = _try_extract_int(not_required_row_text)
-            if not_required_row is None:
-                raise ValueError("測定不要書き込み設定の行は整数で入力してください。")
-
             measure_row_min = LOCKED_BASIC_SETTINGS["measure_row_min"]
-            measure_row_max, tool_start_row = _derive_layout_rows(not_required_row, measure_row_min)
-            if measure_row_max < measure_row_min:
+            measure_row_max = int(self.vars["measure_row_max"].get())
+            min_measure_row_max = measure_row_min + LOCKED_BASIC_SETTINGS["measure_row_step"] - 1
+            if measure_row_max < min_measure_row_max:
                 raise ValueError(
-                    f"測定不要書き込み設定の行は {measure_row_min + 1} 以上で入力してください。"
+                    f"最終測定行は {min_measure_row_max} 以上で入力してください。"
                 )
+            not_required_row, tool_start_row = _derive_layout_rows(measure_row_max, measure_row_min)
             if tool_start_row < 1:
                 raise ValueError("自動計算後の工具開始行が1未満になります。入力値を見直してください。")
             auto_data_start_row = _derive_auto_data_start_row(not_required_row, len(tools))
